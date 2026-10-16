@@ -73,6 +73,7 @@ Un appel d'envoi accepté ou un événement enregistré sans erreur ne prouve pa
 - [Application compagnon](docs/companion.md)
 - [Feuille de route](docs/roadmap.md)
 - [Décisions d'architecture](docs/decisions/README.md)
+- [Journal des modifications](CHANGELOG.md)
 
 ## Travail assisté par agent
 
