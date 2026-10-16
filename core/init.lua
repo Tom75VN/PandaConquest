@@ -5,10 +5,11 @@ local PC = PandaConquest
 PC.name = "pandaConquest"
 -- Same value as ## Version in the .toc (checked by tools/smoke.py). Every
 -- channel line carries it so older builds learn that they are outdated.
-PC.version = "0.4.0"
+-- Changed only by tools/release.py prepare, once per push (decision 0035).
+PC.version = "0.0.1"
 -- Compatibility level n of the channel line PC<n> (decision 0029): raised by any
--- change that can make two builds disagree on the same messages. Lines of
--- another level are never applied.
+-- change that can make two builds disagree on the same messages, at the next
+-- tools/release.py prepare. Lines of another level are never applied.
 PC.channelLevel = 4
 
 local listeners = {}

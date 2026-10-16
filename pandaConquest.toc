@@ -2,7 +2,7 @@
 ## Title: |cffffffffPanda |cfff5ae0aConquest|r
 ## Notes: Community PvE achievements, P2P diagnostics, and shared map POIs.
 ## Author: pandaConquest contributors
-## Version: 0.4.0
+## Version: 0.0.1
 ## SavedVariables: PandaConquestDB
 ## SavedVariablesPerCharacter: PandaConquestImport
 
