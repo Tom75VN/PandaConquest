@@ -1,0 +1,23 @@
+## Interface: 11200
+## Title: |cffffffffPanda |cfff5ae0aConquest|r
+## Notes: Community PvE achievements, P2P diagnostics, and shared map POIs.
+## Author: pandaConquest contributors
+## Version: 0.4.0
+## SavedVariables: PandaConquestDB
+## SavedVariablesPerCharacter: PandaConquestImport
+
+core\init.lua
+core\storage.lua
+core\send_queue.lua
+core\version.lua
+data\pois.lua
+modules\area_contours.lua
+modules\map.lua
+modules\presence.lua
+modules\witness.lua
+modules\progress.lua
+modules\import.lua
+modules\capture.lua
+modules\hunting.lua
+modules\capture_hud.lua
+modules\p2ptest.lua
