@@ -1,52 +1,52 @@
-# pandaConquest
+# PandaConquest
 
-pandaConquest est un addon pour le client OctoWoW (1.12.1, Lua 5.0), consacré aux achievements communautaires PvE.
+PandaConquest is an addon for the OctoWoW client (1.12.1, Lua 5.0), dedicated to community PvE achievements.
 
-L'objectif est de permettre à chaque joueur de débloquer des achievements personnalisés, suivre sa progression, consulter celle des autres utilisateurs et participer à des classements par personnage ou campagne. L'addon doit fonctionner localement sans service externe. Le partage P2P en jeu et une synchronisation cloud facultative pourront compléter ce fonctionnement lorsque leurs contraintes auront été validées.
+The goal is to let each player unlock custom achievements, follow their progress, view other users' progress and take part in leaderboards per character or campaign. The addon must work locally without any external service. In-game P2P sharing and optional cloud synchronization can complete this once their constraints are validated.
 
-## État actuel
+## Current state
 
-Le projet est en **phase 0 : validation du runtime** sur OctoWoW. Un socle expérimental chargeable est présent avec une SavedVariable bornée, des captures brutes de `CHAT_MSG_ADDON` et `CHAT_MSG_CHANNEL`, et les commandes `/pc p2p`. Le code respecte Lua 5.0 et les limites documentées du client 1.12.1 :
+The project is in **phase 0: runtime validation** on OctoWoW. A loadable experimental foundation is present with a bounded SavedVariable, raw captures of `CHAT_MSG_ADDON` and `CHAT_MSG_CHANNEL`, and the `/pc p2p` commands. The code follows Lua 5.0 and the documented limits of the 1.12.1 client:
 
-- messages d'addon bornés à 255 octets préfixe compris, sur PARTY, RAID, GUILD et BATTLEGROUND seulement ;
-- canal hors groupe `PandaConquest` rejoint automatiquement, avec envoi sans action utilisateur via `SendChatMessage` et trafic masqué des fenêtres de discussion (`/pc p2p channelshow` pour l'afficher) ;
-- enveloppe complète du canal bornée à 255 octets ;
-- détection exacte de la monture et du camouflage avec les DLL nampower ou VanillaHelpers d'OctoWoW, avec repli sur les icônes de buffs.
+- addon messages bounded to 255 bytes prefix included, on PARTY, RAID, GUILD and BATTLEGROUND only;
+- out-of-group `PandaConquest` channel joined automatically, with sending through `SendChatMessage` requiring no user action, and traffic hidden from every chat tab except one named exactly `PandaConquest`;
+- complete channel envelope bounded to 255 bytes;
+- exact mount and stealth detection with OctoWoW's nampower or VanillaHelpers DLLs, with a fallback on buff icons.
 
-Aucune campagne à deux clients n'a encore été menée sur OctoWoW : transports, portée du canal entre zones et entre factions, débit, reconnexion et fragmentation restent à mesurer. L'état et la procédure se trouvent dans [Tests P2P](docs/p2p-testing.md#état-de-référence-pour-octowow).
+No two-client campaign has been run on OctoWoW yet: transports, channel reach across zones and between factions, throughput, reconnection and fragmentation remain to be measured. The state and the procedure are in [P2P tests](docs/p2p-testing.md#reference-state-for-octowow).
 
-Le leaderboard complet, le protocole distribué avancé et l'application compagnon ne doivent pas être développés avant ces validations.
+The full leaderboard, the advanced distributed protocol and the companion application must not be developed before these validations.
 
-Un premier socle cartographique est également disponible : les POI peuvent être enregistrés comme points ou groupes de coordonnées, puis rendus en zones grises (neutres), rouges (Horde), bleues (Alliance), jaunes (ressources) ou avec une couleur RGB personnalisée, avec l'icône de leur type au centre. Le contrat est décrit dans [POI et zones sur la carte](docs/map-pois.md).
+A first map foundation is also available: POIs can be registered as points or groups of coordinates, then rendered as gray (neutral), red (Horde), blue (Alliance), yellow (resources) or custom RGB areas, with their type's icon at the center. The contract is described in [POIs and areas on the map](docs/map-pois.md).
 
-## Principes essentiels
+## Core principles
 
-- Le MVP concerne le PvE, pas le contrôle territorial ni le PvP, sauf une exception : la capture des avant-postes `OUTPOST` ([conception](docs/capture.md), décision 0012).
-- Chaque personnage est une identité distincte : `personnage@royaume`.
-- Le fonctionnement hors ligne est obligatoire.
-- L'application compagnon et le cloud Cloudflare restent facultatifs ([décision 0030](docs/decisions/0030-cloudflare-cloud-baseline.md)).
-- Les premières progressions sont monotones : booléen, compteur croissant ou palier.
-- Les données P2P ou cloud ne constituent pas une preuve du serveur.
-- Les capacités réseau ne doivent pas être supposées avant un test reproductible avec deux clients.
+- The MVP is about PvE, not territorial control or PvP, with one exception: the capture of `OUTPOST`s ([design](docs/capture.md), decision 0012).
+- Each character is a distinct identity: `character@realm`.
+- Offline operation is mandatory.
+- The companion application and the Cloudflare cloud stay optional ([decision 0030](docs/decisions/0030-cloudflare-cloud-baseline.md)).
+- The first progress types are monotonic: boolean, increasing counter or tier.
+- P2P or cloud data is no proof from the server.
+- Network capabilities must not be assumed before a reproducible two-client test.
 
 ## Installation
 
-Le dossier `pandaConquest` doit être placé dans :
+The `pandaConquest` folder must be placed in:
 
 ```text
 C:\Games\Wow-Octo\Interface\AddOns\pandaConquest
 ```
 
-### Prérequis : nampower pour les terrains de chasse
+### Requirement: nampower for hunting grounds
 
-La capture des terrains de chasse (`HUNTING_GROUNDS`, [décision 0026](docs/decisions/0026-hunting-grounds-capture.md)) **exige nampower**. Seul son événement `UNIT_DIED` fournit l'identifiant des créatures tuées ; le client 1.12 standard ne le donne pas, et aucun repli n'existe.
+Capturing hunting grounds (`HUNTING_GROUNDS`, [decision 0026](docs/decisions/0026-hunting-grounds-capture.md)) **requires nampower**. Only its `UNIT_DIED` event provides the identifier of killed creatures; the standard 1.12 client does not, and there is no fallback.
 
-- Lancer le jeu avec **le lanceur Octo**, qui charge les DLL nampower, VanillaHelpers et UnitXP_SP3. Un lancement direct de `WoW.exe` ne les charge pas.
-- Sans nampower, les victimes ne sont pas comptées et le HUD du terrain affiche « nampower not detected: launch the game with the Octo launcher ».
-- Vérification en jeu : `/pc hunt` doit lister des fonctions nampower (`GetNampowerVersion`, `GetUnitGUID`, `GetUnitField`) et son compteur `deaths=` augmente quand une créature meurt à proximité.
-- Les avant-postes (`OUTPOST`) et les achievements n'en dépendent pas : nampower ne rend que la détection exacte de la monture et du camouflage plus précise, avec repli sur les icônes de buffs.
+- Start the game with **the Octo launcher**, which loads the nampower, VanillaHelpers and UnitXP_SP3 DLLs. Starting `WoW.exe` directly does not load them.
+- Without nampower, kills are not counted and the ground's HUD asks players to enable NamPower in the Octo launcher.
+- In-game check: `/pc hunt` must list nampower functions (`GetNampowerVersion`, `GetUnitGUID`, `GetUnitField`) and its `deaths=` counter rises when a creature dies nearby.
+- Outposts (`OUTPOST`) and achievements do not depend on it: nampower only makes mount and stealth detection more precise, with a fallback on buff icons.
 
-Le client attendu utilise l'interface `11200`. Après installation ou modification, activer l'addon puis faire `/reload` ; un **nouveau fichier Lua** ajouté au `.toc` n'est chargé qu'après un redémarrage complet du client. Les commandes de départ sont :
+The expected client uses interface `11200`. After installing or changing the addon, enable it then `/reload`; a **new Lua file** added to the `.toc` is only loaded after a full client restart. The starting commands are:
 
 ```text
 /pc p2p status
@@ -57,35 +57,37 @@ Le client attendu utilise l'interface `11200`. Après installation ou modificati
 /pc map
 ```
 
-Un appel d'envoi accepté ou un événement enregistré sans erreur ne prouve pas la livraison. La validation exige deux clients et la procédure de [tests P2P](docs/p2p-testing.md).
+An accepted send call or an event registered without error does not prove delivery. Validation requires two clients and the [P2P tests](docs/p2p-testing.md) procedure.
 
 ## Documentation
 
 - [Vision](docs/vision.md)
+- [Game design](docs/game-design.md)
 - [Architecture](docs/architecture.md)
-- [Modèle de données](docs/data-model.md)
+- [Data model](docs/data-model.md)
 - [Achievements](docs/achievements.md)
-- [POI et zones sur la carte](docs/map-pois.md)
-- [Capture des POI](docs/capture.md)
-- [Protocole P2P](docs/p2p-protocol.md)
-- [Tests P2P](docs/p2p-testing.md)
-- [Sécurité](docs/security.md)
-- [Application compagnon](docs/companion.md)
-- [Feuille de route](docs/roadmap.md)
-- [Décisions d'architecture](docs/decisions/README.md)
-- [Journal des modifications](CHANGELOG.md)
+- [POIs and areas on the map](docs/map-pois.md)
+- [POI capture](docs/capture.md)
+- [P2P protocol](docs/p2p-protocol.md)
+- [P2P safety](docs/p2p-safety.md)
+- [P2P tests](docs/p2p-testing.md)
+- [Security](docs/security.md)
+- [Companion application](docs/companion.md)
+- [Roadmap](docs/roadmap.md)
+- [Architecture decisions](docs/decisions/README.md)
+- [Changelog](CHANGELOG.md)
 
-## Travail assisté par agent
+## Agent-assisted work
 
-Les agents doivent commencer par [AGENTS.md](AGENTS.md), qui renvoie vers [CLAUDE.md](CLAUDE.md). Les recherches dans le projet passent par l'index autonome situé dans `C:\Games\Wow-Octo\#Addons-dev\diagnostics\pandaconquest-index`.
+Agents must start with [AGENTS.md](AGENTS.md), which points to [CLAUDE.md](CLAUDE.md). Searches in the project go through the standalone index located in `C:\Games\Wow-Octo\#Addons-dev\diagnostics\pandaconquest-index`.
 
-Après toute modification de l'addon, documentation comprise :
+After any change to the addon, documentation included:
 
 ```powershell
 python -B "C:\Games\Wow-Octo\#Addons-dev\diagnostics\pandaconquest-index\pandaconquest_index.py" build
 python -B "C:\Games\Wow-Octo\#Addons-dev\diagnostics\pandaconquest-index\pandaconquest_index.py" status
 ```
 
-`status` doit renvoyer le code de sortie 0 (`[UP_TO_DATE]`). Les vérifications Lua 5.0 à lancer avant sont décrites dans [CLAUDE.md](CLAUDE.md).
+`status` must return exit code 0 (`[UP_TO_DATE]`). The Lua 5.0 checks to run before are described in [CLAUDE.md](CLAUDE.md).
 
-Overlord est une référence d'architecture distribuée, pas une base à porter littéralement. Son index se trouve dans `C:\Games\Wow-Octo\#Addons-dev\diagnostics\overlord-index`.
+Overlord is a reference for distributed architecture, not a base to port literally. Its index is in `C:\Games\Wow-Octo\#Addons-dev\diagnostics\overlord-index`.

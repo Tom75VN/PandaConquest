@@ -1,7 +1,7 @@
 ## Interface: 11200
 ## Title: |cffffffffPanda |cfff5ae0aConquest|r
 ## Notes: Community PvE achievements, P2P diagnostics, and shared map POIs.
-## Author: pandaConquest contributors
+## Author: PandaConquest contributors
 ## Version: 0.0.1
 ## SavedVariables: PandaConquestDB
 ## SavedVariablesPerCharacter: PandaConquestImport
@@ -19,5 +19,14 @@ modules\progress.lua
 modules\import.lua
 modules\capture.lua
 modules\hunting.lua
+modules\catchup.lua
+modules\economy.lua
+modules\stock.lua
+modules\army.lua
+modules\garrison.lua
+modules\scout.lua
+modules\attack.lua
 modules\capture_hud.lua
+modules\main_window.lua
+modules\minimap_button.lua
 modules\p2ptest.lua

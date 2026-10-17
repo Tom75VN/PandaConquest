@@ -39,7 +39,10 @@ local CHANNEL_WIRE_PREFIX = "PC" .. tostring(CHANNEL_LEVEL) .. ":" .. tostring(P
 -- PC.Capture:OnMessage (docs/p2p-protocol.md).
 local CHANNEL_ID_BY_TYPE = { HELLO = "HI", DATA = "D" }
 local CHANNEL_TYPE_BY_ID = { HI = "HELLO", D = "DATA", V = "VERSION" }
-local CAPTURE_IDS = { P = true, S = true, Q = true, K = true, H = true, HQ = true }
+local CAPTURE_IDS = {
+  P = true, S = true, Q = true, K = true, H = true, HQ = true, OD = true, OL = true, X = true,
+  G = true, GD = true, GQ = true, SC = true, SQ = true, SL = true, AC = true, AQ = true, AL = true, AR = true,
+}
 local CUSTOM_CHANNEL_MAX_BYTES = 255
 local CUSTOM_CHANNEL_TRANSPORT = "CHANNEL_CHAT"
 -- Octo's own UI whispers addon data through the server: a GUILD addon message
@@ -188,7 +191,7 @@ local function ChannelMessageType(id)
   return CHANNEL_TYPE_BY_ID[id] or id
 end
 
--- Returns parsed, error, meta; nil without error: not pandaConquest traffic.
+-- Returns parsed, error, meta; nil without error: not PandaConquest traffic.
 -- meta = { level, version } whenever the sender's addon version is readable,
 -- even on a line of another level that is not applied.
 function P2P.ParseChannel(text)
@@ -670,91 +673,92 @@ local function FindJoinedChannel(requestedName)
   return nil, "channel is not joined or the join is still pending"
 end
 
-local function AttachJoinedChannel(channel)
-  if not channel then return false, "channel is unavailable" end
+-- Only a chat tab named exactly like the channel shows its lines; every other
+-- tab hides them. The default channel matches by its configured spelling, so
+-- the server's casing of the joined name does not matter.
+local function ChannelTabName(channelName)
+  if type(channelName) ~= "string" then return nil end
+  if string.lower(channelName) == string.lower(DEFAULT_CUSTOM_CHANNEL) then return DEFAULT_CUSTOM_CHANNEL end
+  return channelName
+end
 
-  -- 1.12 shows a channel line only if ChatFrame1.channelList holds it;
-  -- ChatFrame_AddChannel fills that list as well as the saved window setting.
-  local chatFrame = ChatFrame1
-  local ok, result
-  if type(ChatFrame_AddChannel) == "function" and chatFrame and type(chatFrame.channelList) == "table" then
-    local expected = string.lower(channel.name)
-    local i = 1
-    while chatFrame.channelList[i] and string.lower(chatFrame.channelList[i]) ~= expected do
-      i = i + 1
-    end
-    if chatFrame.channelList[i] then
-      ok, result = true, "already listed"
-    else
-      ok, result = pcall(ChatFrame_AddChannel, chatFrame, channel.name)
-    end
-  elseif type(AddChatWindowChannel) == "function" then
-    ok, result = pcall(AddChatWindowChannel, 1, channel.name)
-  else
-    return false, "no chat window channel API is available"
+local function TabShowsChannel(frameIndex, channelName)
+  if type(GetChatWindowInfo) ~= "function" then return false end
+  local ok, tabName = pcall(GetChatWindowInfo, frameIndex)
+  return ok and type(tabName) == "string" and tabName == ChannelTabName(channelName)
+end
+
+local function FrameListsChannel(chatFrame, channelName)
+  if not chatFrame or type(chatFrame.channelList) ~= "table" then return false end
+  local expected = string.lower(channelName)
+  local index, value
+  for index, value in pairs(chatFrame.channelList) do
+    if type(value) == "string" and string.lower(value) == expected then return true end
   end
-  Storage:AddResult({
-    kind = "CHANNEL_CHAT_ATTACH",
-    status = ok and "CALL_ACCEPTED" or "CALL_FAILED",
-    channelId = channel.id,
-    channelName = channel.name,
-    chatFrameId = 1,
-    result = ok and tostring(result) or nil,
-    error = ok and nil or tostring(result),
-  })
-  if not ok then return false, tostring(result) end
-  return true
+  return false
 end
 
 -- 1.12 chat frames drop the lines of a channel missing from their channelList
 -- (ChatFrame_OnEvent), while CHAT_MSG_CHANNEL still reaches every frame that
--- registered it: keeping the channel out of the windows hides the traffic.
--- A tab named like the channel keeps it, so the traffic can be watched in tests.
-local function DetachJoinedChannel(channel)
+-- registered it. The list is rebuilt from the saved window settings on
+-- UPDATE_CHAT_WINDOWS, so it is set here for every tab: added to the tabs named
+-- like the channel, removed from all others.
+local function ApplyChannelDisplay(channel)
   if not channel then return false, "channel is unavailable" end
-  if type(ChatFrame_RemoveChannel) ~= "function" then return false, "ChatFrame_RemoveChannel is unavailable" end
-  local expected = string.lower(channel.name)
-  local removed, kept = 0, 0
+  if type(ChatFrame_AddChannel) ~= "function" or type(ChatFrame_RemoveChannel) ~= "function" then
+    return false, "chat window channel API is unavailable"
+  end
+  local removed, added, kept = 0, 0, 0
   local frameIndex = 1
   while frameIndex <= (NUM_CHAT_WINDOWS or 7) do
     local chatFrame = getglobal("ChatFrame" .. frameIndex)
-    local tabName
-    if type(GetChatWindowInfo) == "function" then
-      local infoOk, infoName = pcall(GetChatWindowInfo, frameIndex)
-      if infoOk and type(infoName) == "string" then tabName = string.lower(infoName) end
-    end
-    if tabName == expected then
-      kept = kept + 1
-    elseif chatFrame and type(chatFrame.channelList) == "table" then
-      local listed = false
-      local index, value
-      for index, value in pairs(chatFrame.channelList) do
-        if type(value) == "string" and string.lower(value) == expected then listed = true end
+    if chatFrame and type(chatFrame.channelList) == "table" then
+      local listed = FrameListsChannel(chatFrame, channel.name)
+      if TabShowsChannel(frameIndex, channel.name) then
+        if listed then
+          kept = kept + 1
+        elseif pcall(ChatFrame_AddChannel, chatFrame, channel.name) then
+          added = added + 1
+        end
+      elseif listed and pcall(ChatFrame_RemoveChannel, chatFrame, channel.name) then
+        removed = removed + 1
       end
-      if listed and pcall(ChatFrame_RemoveChannel, chatFrame, channel.name) then removed = removed + 1 end
     end
     frameIndex = frameIndex + 1
   end
   Storage:AddResult({
-    kind = "CHANNEL_CHAT_DETACH",
+    kind = "CHANNEL_CHAT_DISPLAY",
     status = "COMPLETED",
     channelId = channel.id,
     channelName = channel.name,
     removedFrames = removed,
+    addedFrames = added,
     keptFrames = kept,
   })
   return true
 end
 
-local function ChannelShown()
-  local db = Storage:GetDB()
-  return db and type(db.settings) == "table" and db.settings.channelShown == true
+-- Display guard: a chat frame drops the default channel's lines unless its tab
+-- is named exactly like the channel, whatever its channelList holds (a client
+-- rebuild or another addon may put the channel back). A matching tab gets the
+-- channel listed so the line shows. Display only: reception has its own frame.
+local function InstallChannelDisplayGuard()
+  if type(ChatFrame_OnEvent) ~= "function" then return end
+  local original = ChatFrame_OnEvent
+  ChatFrame_OnEvent = function(event)
+    if type(event) == "string" and string.sub(event, 1, 16) == "CHAT_MSG_CHANNEL"
+      and event ~= "CHAT_MSG_CHANNEL_LIST" and type(arg9) == "string"
+      and string.lower(arg9) == string.lower(DEFAULT_CUSTOM_CHANNEL)
+      and this and type(this.GetID) == "function" then
+      if not TabShowsChannel(this:GetID(), arg9) then return end
+      if not FrameListsChannel(this, arg9) and type(ChatFrame_AddChannel) == "function" then
+        pcall(ChatFrame_AddChannel, this, arg9)
+      end
+    end
+    return original(event)
+  end
 end
-
-local function ApplyChannelDisplay(channel)
-  if ChannelShown() then return AttachJoinedChannel(channel) end
-  return DetachJoinedChannel(channel)
-end
+InstallChannelDisplayGuard()
 
 local function CompleteAutoJoinCycle(status, channel, errorText)
   local attempts = autoJoinState and autoJoinState.attempts or 0
@@ -771,14 +775,27 @@ local function CompleteAutoJoinCycle(status, channel, errorText)
       local applied, applyError = ApplyChannelDisplay(channel)
       if not applied then
         PC.Print("custom channel joined, chat display not applied: " .. tostring(applyError))
-      elseif ChannelShown() then
-        PC.Print("custom channel joined and shown in chat: " .. channel.name .. " id=" .. tostring(channel.id))
       end
       -- Tell the channel which build we run; older peers get warned, and newer
       -- ones answer so that we get warned (core/version.lua).
       if PC.Version then
         local announced, announceError = pcall(PC.Version.Announce, PC.Version)
         if not announced then PC.RecordError("version announce", announceError) end
+      end
+      -- Owner catch-up digest, 10 s later (modules/catchup.lua, decision 0038).
+      if PC.Catchup then
+        local joined, joinError = pcall(PC.Catchup.OnJoined, PC.Catchup)
+        if not joined then PC.RecordError("catch-up join", joinError) end
+      end
+      -- Scouts under way and discoveries (modules/scout.lua, decision 0050).
+      if PC.Scout then
+        local asked, askError = pcall(PC.Scout.OnJoined, PC.Scout)
+        if not asked then PC.RecordError("scout join", askError) end
+      end
+      -- Armies under way and pending battles (modules/attack.lua, decision 0052).
+      if PC.Attack then
+        local asked, askError = pcall(PC.Attack.OnJoined, PC.Attack)
+        if not asked then PC.RecordError("attack join", askError) end
       end
     end
   elseif status == "FAILED" then
@@ -847,24 +864,6 @@ local function StartAutoJoin()
   channelJoinFrame:SetScript("OnUpdate", AutoJoinTick)
 end
 
-local function SetChannelShown(shown)
-  local db = Storage:GetDB()
-  if db and type(db.settings) == "table" then db.settings.channelShown = shown and true or nil end
-  local channel, channelError = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
-  if not channel then return false, channelError end
-  local ok, applyError = ApplyChannelDisplay(channel)
-  if not ok then return false, applyError end
-  return true, nil, channel
-end
-
-local function AttachDiagnosticChannel(requestedName)
-  local channel, channelError = FindJoinedChannel(requestedName)
-  if not channel then return false, channelError end
-  local ok, attachError = AttachJoinedChannel(channel)
-  if not ok then return false, attachError end
-  return true, nil, channel
-end
-
 local function OpenPreparedChatNow(text)
   if type(ChatFrame_OpenChat) == "function" then
     local ok, err = pcall(ChatFrame_OpenChat, text)
@@ -928,7 +927,7 @@ local function PrepareChannelMessage(messageType, data, requestedName)
   if not id then return false, "invalid message type" end
   if not IsPrintableASCII(data or "") then return false, "data must contain printable ASCII only" end
 
-  local attached, attachError = AttachDiagnosticChannel(channel.name)
+  local attached, attachError = ApplyChannelDisplay(channel)
   if not attached then return false, attachError end
 
   local db = Storage:GetDB()
@@ -1583,7 +1582,7 @@ local function StartBurst(transport, count, dataBytes, rate)
   if not normalized then return false, transportError end
   if count < 1 or count > MAX_BURST_COUNT then return false, "count must be between 1 and 50" end
   if dataBytes < 12 or dataBytes > MAX_DATA_BYTES then return false, "data bytes must be between 12 and " .. MAX_DATA_BYTES end
-  if rate ~= 1 and rate ~= 2 and rate ~= 4 then return false, "rate must be 1, 2, or 4 messages/second (send gate: one call per 0.25 s)" end
+  if rate ~= 1 and rate ~= 2 and rate ~= 4 then return false, "rate must be 1, 2, or 4 messages/second (send gate: 0.25 s apart, a 1.1 s pause after 6 close sends)" end
   if ((count - 1) / rate) > MAX_BURST_SECONDS then return false, "burst duration would exceed 10 seconds" end
 
   burstState = {
@@ -1619,8 +1618,8 @@ local function PrintStatus()
   PC.Print("CHAT_MSG_CHANNEL registration=" .. (channelRegistration.accepted and "accepted" or "failed") .. " assisted transport=" .. CUSTOM_CHANNEL_TRANSPORT)
   local joinedChannel = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
   if joinedChannel then
-    PC.Print("custom channel=" .. joinedChannel.name .. " id=" .. tostring(joinedChannel.id) .. " joined=yes chat="
-      .. (ChannelShown() and "shown" or "hidden"))
+    PC.Print("custom channel=" .. joinedChannel.name .. " id=" .. tostring(joinedChannel.id) .. " joined=yes chat=tab "
+      .. DEFAULT_CUSTOM_CHANNEL .. " only")
   elseif autoJoinState then
     PC.Print("custom channel=" .. DEFAULT_CUSTOM_CHANNEL .. " joined=pending status=" .. tostring(autoJoinState.lastStatus) .. " attempts=" .. tostring(autoJoinState.attempts))
   else
@@ -1676,14 +1675,20 @@ local function PrintLog(requested)
 end
 
 local function PrintHelp()
+  PC.Print("/pc or /pc ui (open or close the PandaConquest window); /pc help (this list)")
   PC.Print("/pc map (world-map POI area renderer status)")
   PC.Print("/pc map probe | probe off (area-texture test squares on the world map)")
   PC.Print("/pc where (player position and the POI it is inside)")
   PC.Print("/pc capture (outpost capture states and transport counters)")
   PC.Print("/pc hunt (hunting ground kills, last credited death and states)")
+  PC.Print("/pc army (reserve, unit costs and whether you can recruit here)")
+  PC.Print("/pc recruit <unit> [count] (in an Outpost or Settlement of your faction; footman, rifleman, mortar, scout)")
+  PC.Print("/pc garrison (garrison, Settlement level and fund of the place you stand in)")
+  PC.Print("/pc donate <unit|gold|wood> [count] confirm (irreversible gift to the garrison or Settlement fund)")
+  PC.Print("/pc scout [POI id] (scouting status and targets, or send your scout to an enemy Outpost or Settlement)")
+  PC.Print("/pc attack [POI id footmen riflemen mortars] (armies and battles, or send an army to a discovered enemy place)")
   PC.Print("/pc p2p status")
   PC.Print("/pc p2p join [channel-name] | channels")
-  PC.Print("/pc p2p channelshow | channelhide (show or hide the transport channel in chat; saved)")
   PC.Print("/pc p2p channelauto (hidden CHANNEL SendAddonMessage experiments; no Enter)")
   PC.Print("/pc p2p channelvisibleauto (automatic visible API probes; no Enter)")
   PC.Print("/pc p2p channelsend <printable ASCII text> (automatic visible P2P)")
@@ -1716,14 +1721,6 @@ local function ChannelCommand(command, rest)
     JoinDiagnosticChannel(channelName)
   elseif command == "channels" then
     PrintJoinedChannels()
-  elseif command == "channelshow" or command == "channelhide" then
-    local shown = command == "channelshow"
-    local ok, err, channel = SetChannelShown(shown)
-    if ok then
-      PC.Print("channel " .. channel.name .. " is now " .. (shown and "shown in ChatFrame1" or "hidden from the chat windows") .. "; the choice is saved.")
-    else
-      PC.Print("channel display saved but not applied: " .. tostring(err))
-    end
   elseif command == "twhisper" then
     local target, tail = TakeWord(rest)
     local ok, err
@@ -1740,14 +1737,14 @@ local function ChannelCommand(command, rest)
   elseif command == "channelauto" then
     local ok, err, attempted, accepted = SendAutomaticChannelProbes()
     if ok then
-      PC.Print("automatic hidden CHANNEL probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (one call per 0.25 s); no Enter was required.")
+      PC.Print("automatic hidden CHANNEL probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (0.25 s apart, 1.1 s pause after 6 close sends); no Enter was required.")
     else
       PC.Print("automatic hidden CHANNEL probes not completed: " .. tostring(err))
     end
   elseif command == "channelvisibleauto" then
     local ok, err, attempted, accepted = SendVisibleAutomaticChannelProbes()
     if ok then
-      PC.Print("automatic visible CHANNEL probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (one call per 0.25 s); no Enter is required.")
+      PC.Print("automatic visible CHANNEL probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (0.25 s apart, 1.1 s pause after 6 close sends); no Enter is required.")
     else
       PC.Print("automatic visible CHANNEL probes not started: " .. tostring(err))
     end
@@ -1762,7 +1759,7 @@ local function ChannelCommand(command, rest)
     local target = TakeWord(rest)
     local ok, err, attempted, accepted = SendInvisibleTransportProbes(target)
     if ok then
-      PC.Print("non-group invisible probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (one call per 0.25 s); no Enter was required.")
+      PC.Print("non-group invisible probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (0.25 s apart, 1.1 s pause after 6 close sends); no Enter was required.")
     else
       PC.Print("non-group invisible probes not completed: " .. tostring(err))
     end
@@ -1781,6 +1778,14 @@ end
 
 local function SlashCommand(message)
   local scope, rest = TakeWord(message)
+  if scope == nil or string.lower(scope) == "ui" then
+    if not PC.MainWindow or not PC.MainWindow.Toggle then
+      PC.Print("the PandaConquest window is unavailable (restart the client after an update)")
+      return
+    end
+    PC.MainWindow:Toggle()
+    return
+  end
   if string.lower(scope or "") == "map" then
     if not PC.Map or not PC.Map.GetStatus then
       PC.Print("map renderer is unavailable")
@@ -1815,6 +1820,54 @@ local function SlashCommand(message)
       return
     end
     PC.Presence:PrintStatus()
+    return
+  end
+  if string.lower(scope or "") == "res" or string.lower(scope or "") == "resources" then
+    if not PC.Stock or not PC.Stock.PrintStatus then
+      PC.Print("resources are unavailable")
+      return
+    end
+    PC.Stock:PrintStatus()
+    return
+  end
+  if string.lower(scope or "") == "army" or string.lower(scope or "") == "recruit" then
+    if not PC.Army or not PC.Army.PrintStatus then
+      PC.Print("army is unavailable")
+      return
+    end
+    if string.lower(scope) == "recruit" then
+      PC.Army:RecruitCommand(rest)
+    else
+      PC.Army:PrintStatus()
+    end
+    return
+  end
+  if string.lower(scope or "") == "garrison" or string.lower(scope or "") == "donate" then
+    if not PC.Garrison or not PC.Garrison.PrintStatus then
+      PC.Print("garrisons are unavailable")
+      return
+    end
+    if string.lower(scope) == "donate" then
+      PC.Garrison:DonateCommand(rest)
+    else
+      PC.Garrison:PrintStatus()
+    end
+    return
+  end
+  if string.lower(scope or "") == "scout" then
+    if not PC.Scout or not PC.Scout.Command then
+      PC.Print("scouting is unavailable")
+      return
+    end
+    PC.Scout:Command(rest)
+    return
+  end
+  if string.lower(scope or "") == "attack" then
+    if not PC.Attack or not PC.Attack.Command then
+      PC.Print("attacks are unavailable")
+      return
+    end
+    PC.Attack:Command(rest)
     return
   end
   if string.lower(scope or "") == "capture" then

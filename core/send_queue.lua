@@ -5,11 +5,22 @@ local PC = PandaConquest
 -- Every P2P send, on every transport, goes through this gate: at most one
 -- client send call every MIN_GAP seconds (decision 0023). Bursts wait in a
 -- bounded FIFO drained by OnUpdate.
+--
+-- VMangos anti-flood (decision 0040, MasterPlayer::UpdateSpeakTime): on whole
+-- server seconds, a message in the same second as the previous one adds one to
+-- a counter, a later one resets it, and the 10th addition mutes for 10 s.
+-- floodChain mirrors that counter from above: a send less than FLOOD_GAP after
+-- the previous one adds one, a longer gap resets it, and once FLOOD_BURST is
+-- reached the gate waits FLOOD_GAP. The margin under 10 leaves room for chat
+-- the player types and for messages the network delivers closer together.
 local SendQueue = {
   MIN_GAP = 0.25,
+  FLOOD_GAP = 1.1,
+  FLOOD_BURST = 5,
   MAX_QUEUED = 16,
   queue = {},
   lastSentAt = nil,
+  floodChain = 0,
   sent = 0,
   delayed = 0,
   coalesced = 0,
@@ -37,6 +48,11 @@ local function Finish(entry, ok, err, skipped)
 end
 
 local function Dispatch(entry, now)
+  if SendQueue.lastSentAt and now - SendQueue.lastSentAt < SendQueue.FLOOD_GAP then
+    SendQueue.floodChain = SendQueue.floodChain + 1
+  else
+    SendQueue.floodChain = 0
+  end
   SendQueue.lastSentAt = now
   SendQueue.sent = SendQueue.sent + 1
   if entry.queuedAt and now - entry.queuedAt > SendQueue.maxWait then
@@ -49,7 +65,10 @@ local function Dispatch(entry, now)
 end
 
 function SendQueue:Ready(now)
-  return not self.lastSentAt or now - self.lastSentAt >= self.MIN_GAP
+  if not self.lastSentAt then return true end
+  local gap = now - self.lastSentAt
+  if gap >= self.FLOOD_GAP then return true end
+  return gap >= self.MIN_GAP and self.floodChain < self.FLOOD_BURST
 end
 
 function SendQueue:Pending()
@@ -133,7 +152,8 @@ function SendQueue:Submit(entry)
 end
 
 function SendQueue:Summary()
-  return "send gate gap=" .. self.MIN_GAP .. "s queued=" .. table.getn(self.queue) .. "/" .. self.MAX_QUEUED
+  return "send gate gap=" .. self.MIN_GAP .. "s flood=" .. self.floodChain .. "/" .. self.FLOOD_BURST
+    .. " (pause " .. self.FLOOD_GAP .. "s) queued=" .. table.getn(self.queue) .. "/" .. self.MAX_QUEUED
     .. " sent=" .. self.sent .. " delayed=" .. self.delayed .. " superseded=" .. self.coalesced
     .. " dropped=" .. self.dropped .. " maxWait=" .. string.format("%.2f", self.maxWait) .. "s"
 end

@@ -59,21 +59,27 @@ Map.POI_ICONS = {
   FARM = POI_ICON_TEXTURE,
 }
 
--- Rows follow the sheet order (one per type).
+-- Controlled POIs occupy one row each; all resources share the last row.
 Map.POI_ICON_ROWS = {
   HUNTING_GROUNDS = 0,
   OUTPOST = 1,
   SETTLEMENT = 2,
-  GOLD_MINE = 3,
-  FOREST = 4,
-  FARM = 5,
+GOLD_MINE = 4,
+FOREST = 4,
+FARM = 4,
 }
 
--- Columns are capture states for controlled POIs. Resource rows contain the
--- same coloured neutral icon in every column and always select column zero.
+-- Columns are capture states for controlled POIs.
 Map.POI_ICON_COLUMNS = {
   HORDE = 2,
   ALLIANCE = 4,
+}
+
+-- Resource POIs have one permanent icon each, packed onto their shared row.
+Map.POI_ICON_RESOURCE_COLUMNS = {
+  GOLD_MINE = 0,
+  FOREST = 1,
+  FARM = 2,
 }
 
 -- Half-captured columns, shown while a challenger holds 50 % or more.
@@ -86,7 +92,7 @@ function Map.GetIconTexCoord(poiType, colorKey, column)
   local row = Map.POI_ICON_ROWS[poiType]
   if not row then return { 0, 1, 0, 1 } end
   if Map.RESOURCE_TYPES[poiType] then
-    column = 0
+    column = Map.POI_ICON_RESOURCE_COLUMNS[poiType] or 0
   else
     column = column or Map.POI_ICON_COLUMNS[colorKey or ""] or 0
   end
@@ -387,7 +393,9 @@ end
 
 -- Shows the captured owner (HORDE, ALLIANCE, or nil for the static colour) and a
 -- half-captured icon for the challenger at 50 % or more. Returns true on change.
-function Map:SetCaptureView(id, ownerKey, halfKey)
+-- unconfirmed: the owner is only a hint of other players (decision 0038), drawn
+-- halfway to grey.
+function Map:SetCaptureView(id, ownerKey, halfKey, unconfirmed)
   local area = type(id) == "string" and self.areas[id] or nil
   if not area then return false end
   if area.baseColorKey == nil then
@@ -400,12 +408,19 @@ function Map:SetCaptureView(id, ownerKey, halfKey)
   if preset then
     colorKey = ownerKey
     color = { preset[1], preset[2], preset[3] }
+    if unconfirmed then
+      color = { (preset[1] + 0.5) / 2, (preset[2] + 0.5) / 2, (preset[3] + 0.5) / 2 }
+    end
   end
+  unconfirmed = preset and unconfirmed and true or nil
   local column = halfKey and Map.POI_ICON_HALF_COLUMNS[halfKey] or nil
-  if area.colorKey == colorKey and area.iconColumn == column then return false end
+  if area.colorKey == colorKey and area.iconColumn == column and area.unconfirmed == unconfirmed then
+    return false
+  end
   area.colorKey = colorKey
   area.color = color
   area.iconColumn = column
+  area.unconfirmed = unconfirmed
   self.dirty = true
   return true
 end
@@ -471,21 +486,23 @@ local function GetCurrentMapFile()
   return name
 end
 
-local function CreateGroup()
+local function CreateGroup(name, levelOffset)
   local canvas = GetCanvas()
   local create = GetGlobal("CreateFrame")
   if not canvas or type(create) ~= "function" then return nil end
 
-  Map.groupSerial = Map.groupSerial + 1
-  local ok, frame = pcall(create, "Frame",
-    "PandaConquestMapAreaGroup" .. tostring(Map.groupSerial), canvas)
+  if not name then
+    Map.groupSerial = Map.groupSerial + 1
+    name = "PandaConquestMapAreaGroup" .. tostring(Map.groupSerial)
+  end
+  local ok, frame = pcall(create, "Frame", name, canvas)
   if not ok or not frame then return nil end
   if type(frame.SetAllPoints) == "function" then pcall(frame.SetAllPoints, frame, canvas) end
   if type(frame.EnableMouse) == "function" then pcall(frame.EnableMouse, frame, false) end
   if type(canvas.GetFrameLevel) == "function" and type(frame.SetFrameLevel) == "function" then
     local levelOk, level = pcall(canvas.GetFrameLevel, canvas)
     if levelOk and type(level) == "number" then
-      pcall(frame.SetFrameLevel, frame, level + 1)
+      pcall(frame.SetFrameLevel, frame, level + (levelOffset or 1))
     end
   end
   HideObject(frame)
@@ -594,6 +611,9 @@ local function GetIconPosition(area)
   end
   return (minX + maxX) / 200, (minY + maxY) / 200
 end
+
+-- Also the anchor of travel distances (modules/scout.lua, decision 0050).
+Map.IconPosition = GetIconPosition
 
 local function PlaceIcon(entry, area, width, height)
   local path = Map.POI_ICONS[area.type]
@@ -727,7 +747,295 @@ function Map:StepBuildQueue()
   return true
 end
 
+-- Scout routes (roadmap WP8, docs/scouting.md, decision 0051) ----------------
+-- Every scout still travelling is drawn on the displayed zone map, for both
+-- factions and without its sender: a dotted straight line from its origin to
+-- its target and its icon at the share of the trip elapsed. A route between
+-- two zones of one continent is drawn in continent coordinates and clipped to
+-- the displayed zone, so each zone shows its own part; a route to another
+-- continent (abstract sea crossing) and the continent maps show nothing.
+-- Local display only: nothing is sent.
+local ROUTE_TEXTURE = "Interface\\Buttons\\WHITE8X8"
+local ROUTE_DOT_SIZE = 3
+local ROUTE_DOT_GAP = 9
+local ROUTE_DOT_ALPHA = 0.9
+-- Dots this close to an endpoint would sit under its POI icon.
+local ROUTE_ICON_CLEAR = POI_ICON_SIZE * ICON_HIT_RATIO
+local ROUTE_MAX = 16
+local ROUTE_MAX_DOTS = 800
+local SCOUT_ICON_SIZE = 20
+local SCOUT_ICON_DIR = "Interface\\AddOns\\pandaConquest\\media\\Textures\\Icons\\War3Units\\"
+local SCOUT_ICONS = { A = SCOUT_ICON_DIR .. "BTNKnight", H = SCOUT_ICON_DIR .. "BTNRaider" }
+-- Armies (decision 0052): the faction's basic soldier.
+local ARMY_ICONS = { A = SCOUT_ICON_DIR .. "BTNFootman", H = SCOUT_ICON_DIR .. "BTNGrunt" }
+local SCOUT_COLORS = { A = Map.COLORS.ALLIANCE, H = Map.COLORS.HORDE }
+-- Zone rectangles on their continent in world yards: left, right, top,
+-- bottom, continent (1.12 WorldMapArea, not measured on OctoWoW). Widths and
+-- heights equal Scout.ZONES; tools/smoke.py checks both stay equal.
+local ROUTE_ZONES = {
+  elwynn = { 1535.4166, -1935.4166, -7939.5833, -10254.1666, "EK" },
+  westfall = { 3016.6665, -1483.3334, -9400.0, -12400.0, "EK" },
+  durotar = { -1962.4999, -7249.9995, 1808.3333, -1716.6666, "KA" },
+  barrens = { 2622.9165, -7510.4165, 1612.4999, -5143.75, "KA" },
+}
+
+Map.ROUTE_ZONES = ROUTE_ZONES
+Map.routes = { slots = {}, dots = {}, count = 0, dotCount = 0, iconCount = 0 }
+
+-- An area's icon anchor in units of the displayed zone map (outside 0-1 when
+-- it lies on another zone), or nil when the zones share no continent.
+local function RoutePoint(area, mapKey)
+  if not area or not area.enabled then return nil end
+  local x, y = GetIconPosition(area)
+  if not x or area.mapKey == mapKey then return x, y end
+  local from, to = ROUTE_ZONES[area.mapKey or ""], ROUTE_ZONES[mapKey or ""]
+  if not from or not to or from[5] ~= to[5] then return nil end
+  local worldY = from[1] - x * (from[1] - from[2])
+  local worldX = from[3] - y * (from[3] - from[4])
+  return (to[1] - worldY) / (to[1] - to[2]), (to[3] - worldX) / (to[3] - to[4])
+end
+
+-- One edge of the Liang-Barsky clip: keeps the shares t where p * t <= q.
+local function ClipEdge(p, q, t0, t1)
+  if p == 0 then
+    if q < 0 then return nil end
+    return t0, t1
+  end
+  local t = q / p
+  if p < 0 then
+    if t > t1 then return nil end
+    if t > t0 then t0 = t end
+  else
+    if t < t0 then return nil end
+    if t < t1 then t1 = t end
+  end
+  return t0, t1
+end
+
+-- The shares [t0, t1] of the segment inside the 0-1 map, or nil when none is.
+local function ClipRoute(ax, ay, bx, by)
+  local dx, dy = bx - ax, by - ay
+  local t0, t1 = ClipEdge(-dx, ax, 0, 1)
+  if t0 then t0, t1 = ClipEdge(dx, 1 - ax, t0, t1) end
+  if t0 then t0, t1 = ClipEdge(-dy, ay, t0, t1) end
+  if t0 then t0, t1 = ClipEdge(dy, 1 - ay, t0, t1) end
+  if not t0 or t0 > t1 then return nil end
+  return t0, t1
+end
+
+-- The texture list[key], created once on the route frame.
+local function RouteTexture(list, key, frame, layer)
+  local texture = list[key]
+  if texture then return texture end
+  if type(frame.CreateTexture) ~= "function" then return nil end
+  local ok, created = pcall(frame.CreateTexture, frame, nil, layer)
+  if not ok or not created then return nil end
+  list[key] = created
+  return created
+end
+
+-- Lays one route's dots from dot number first + 1; returns the last number used.
+local function LayoutDots(frame, slot, first, width, height)
+  local dots = Map.routes.dots
+  local dx, dy = (slot.bx - slot.ax) * width, (slot.by - slot.ay) * height
+  local length = math.sqrt(dx * dx + dy * dy)
+  if length <= 0 then return first end
+  local color = SCOUT_COLORS[slot.record.fac]
+  local step = ROUTE_DOT_GAP / length
+  local k = math.ceil(slot.t0 / step)
+  local t = k * step
+  local used = first
+  while t <= slot.t1 and used < ROUTE_MAX_DOTS do
+    if t * length >= ROUTE_ICON_CLEAR and (1 - t) * length >= ROUTE_ICON_CLEAR then
+      local dot = RouteTexture(dots, used + 1, frame, "ARTWORK")
+      if not dot then return used end
+      used = used + 1
+      if dot.pandaConquestPath ~= ROUTE_TEXTURE then
+        dot:SetTexture(ROUTE_TEXTURE)
+        dot.pandaConquestPath = ROUTE_TEXTURE
+        dot:SetWidth(ROUTE_DOT_SIZE)
+        dot:SetHeight(ROUTE_DOT_SIZE)
+      end
+      dot:SetVertexColor(color[1], color[2], color[3], ROUTE_DOT_ALPHA)
+      dot:ClearAllPoints()
+      dot:SetPoint("CENTER", frame, "TOPLEFT", slot.ax * width + t * dx, -(slot.ay * height + t * dy))
+      dot:Show()
+    end
+    k = k + 1
+    t = k * step
+  end
+  return used
+end
+
+local function HideDots(from)
+  local routes = Map.routes
+  local index = from
+  while index <= routes.dotCount do
+    HideObject(routes.dots[index])
+    index = index + 1
+  end
+  if from - 1 < routes.dotCount then routes.dotCount = from - 1 end
+end
+
+-- Hides the slots from number first on and forgets their records.
+local function ReleaseSlots(first)
+  local slots = Map.routes.slots
+  local index = first
+  while index <= table.getn(slots) do
+    HideObject(slots[index].icon)
+    slots[index].record = nil
+    slots[index].iconShown = false
+    index = index + 1
+  end
+end
+
+function Map:HideRoutes()
+  local routes = self.routes
+  HideDots(1)
+  ReleaseSlots(1)
+  HideObject(routes.frame)
+  routes.count = 0
+  routes.iconCount = 0
+  routes.layoutMap = nil
+end
+
+-- One travelling record (a scout or an army) placed in the next route slot
+-- if its line crosses the displayed zone. Returns the new count and whether
+-- the slot changed record.
+local function PlaceRoute(map, slots, count, r, path, mapKey, now)
+  if count >= ROUTE_MAX or type(r) ~= "table" or not path or type(r.depart) ~= "number"
+      or type(r.dur) ~= "number" or r.dur <= 0 or r.depart + r.dur <= now then
+    return count, false
+  end
+  local ax, ay = RoutePoint(map.areas[r.origin or ""], mapKey)
+  local bx, by = RoutePoint(map.areas[r.target or ""], mapKey)
+  local t0, t1
+  if ax and bx then t0, t1 = ClipRoute(ax, ay, bx, by) end
+  if not t0 then return count, false end
+  count = count + 1
+  local slot = slots[count]
+  if not slot then
+    slot = {}
+    slots[count] = slot
+  end
+  local changed = false
+  if slot.record ~= r then
+    changed = true
+    slot.record = r
+  end
+  slot.path = path
+  slot.ax, slot.ay, slot.bx, slot.by, slot.t0, slot.t1 = ax, ay, bx, by, t0, t1
+  return count, changed
+end
+
+-- Draws the scouts and armies travelling on the displayed zone (decisions
+-- 0051, 0052). The dots are laid out again only when the routes, the map, the
+-- canvas or the areas change; the icons move on every refresh. Returns the
+-- number of routes drawn.
+function Map:RefreshRoutes(mapKey, width, height)
+  local routes = self.routes
+  local scout = PC.Scout
+  local attack = PC.Attack
+  local now = PC.Now and PC.Now() or 0
+  local scouts = scout and type(scout.records) == "table"
+  local armies = attack and type(attack.Marching) == "function"
+  if (not scouts and not armies) or type(now) ~= "number" then
+    self:HideRoutes()
+    return 0
+  end
+
+  local slots = routes.slots
+  local count = 0
+  local changed = routes.layoutMap ~= mapKey or routes.layoutWidth ~= width
+    or routes.layoutHeight ~= height or routes.layoutRevision ~= self.revision
+  local moved
+  local key, r
+  if scouts then
+    for key, r in pairs(scout.records) do
+      count, moved = PlaceRoute(self, slots, count, r, type(r) == "table" and SCOUT_ICONS[r.fac], mapKey, now)
+      if moved then changed = true end
+    end
+  end
+  if armies then
+    local list = attack:Marching(now)
+    local index = 1
+    while index <= table.getn(list) do
+      r = list[index]
+      count, moved = PlaceRoute(self, slots, count, r, ARMY_ICONS[r.fac], mapKey, now)
+      if moved then changed = true end
+      index = index + 1
+    end
+  end
+  if count ~= routes.count then changed = true end
+  ReleaseSlots(count + 1)
+  routes.count = count
+  if count == 0 then
+    self:HideRoutes()
+    return 0
+  end
+
+  if not routes.frame then routes.frame = CreateGroup("PandaConquestMapRoutes", 2) end
+  local frame = routes.frame
+  if not frame then return 0 end
+  local index
+  if changed then
+    routes.layoutMap, routes.layoutWidth, routes.layoutHeight = mapKey, width, height
+    routes.layoutRevision = self.revision
+    local used = 0
+    index = 1
+    while index <= count do
+      used = LayoutDots(frame, slots[index], used, width, height)
+      index = index + 1
+    end
+    HideDots(used + 1)
+    routes.dotCount = used
+  end
+
+  local icons = 0
+  index = 1
+  while index <= count do
+    local slot = slots[index]
+    local record = slot.record
+    local t = Clamp((now - record.depart) / record.dur, 0, 1)
+    local icon = nil
+    if t >= slot.t0 and t <= slot.t1 then icon = RouteTexture(slot, "icon", frame, "OVERLAY") end
+    if icon then
+      local path = slot.path
+      if icon.pandaConquestPath ~= path then
+        icon:SetTexture(path)
+        icon.pandaConquestPath = path
+        icon:SetWidth(SCOUT_ICON_SIZE)
+        icon:SetHeight(SCOUT_ICON_SIZE)
+      end
+      slot.iconX = slot.ax + t * (slot.bx - slot.ax)
+      slot.iconY = slot.ay + t * (slot.by - slot.ay)
+      icon:ClearAllPoints()
+      icon:SetPoint("CENTER", frame, "TOPLEFT", slot.iconX * width, -slot.iconY * height)
+      icon:Show()
+      slot.iconShown = true
+      icons = icons + 1
+    else
+      HideObject(slot.icon)
+      slot.iconShown = false
+    end
+    index = index + 1
+  end
+  routes.iconCount = icons
+  local canvas = GetCanvas()
+  if canvas and type(frame.SetAllPoints) == "function" then frame:SetAllPoints(canvas) end
+  frame:Show()
+  return count
+end
+
+local function DrawRoutes(mapKey, width, height)
+  local ok, err = pcall(Map.RefreshRoutes, Map, mapKey, width, height)
+  if ok then return end
+  pcall(Map.HideRoutes, Map)
+  if PC.RecordError then PC.RecordError("map routes", err) end
+end
+
 function Map:HideAll()
+  self:HideRoutes()
   self:ClearHover()
   local index = 1
   while index <= table.getn(self.order) do
@@ -779,6 +1087,7 @@ function Map:Refresh(force)
     .. "|" .. tostring(self.revision)
   if not force and not self.dirty and self.lastSignature == signature then
     ReapplyVisibleGroups()
+    DrawRoutes(mapKey, width, height)
     return true
   end
 
@@ -827,6 +1136,7 @@ function Map:Refresh(force)
     end
     index = index + 1
   end
+  DrawRoutes(mapKey, width, height)
   return true
 end
 
@@ -849,6 +1159,8 @@ function Map:GetStatus()
     building = building,
     failures = self.failures,
     cached = self.cacheCount,
+    routes = self.routes.count,
+    routeDots = self.routes.dotCount,
   }
 end
 
@@ -953,6 +1265,10 @@ local function ShowAreaTooltip(canvas, area)
     if not Map.RESOURCE_TYPES[area.type] then
       AddFactionLine(tooltip, "Owner", info and info.owner or OWNER_CODES[area.colorKey or ""] or "N")
     end
+    if info and info.hint then
+      AddFactionLine(tooltip, "Unconfirmed", info.hint.owner, " (" .. info.hint.count .. " player(s), "
+        .. FormatDuration(info.hint.age) .. " ago)")
+    end
     if info and info.challenger then
       AddFactionLine(tooltip, "Capture", info.challenger, " " .. info.percent .. "%")
     end
@@ -961,11 +1277,65 @@ local function ShowAreaTooltip(canvas, area)
       if info.remaining then status = status .. " (" .. FormatDuration(info.remaining) .. ")" end
       tooltip:AddLine(status, 1, 1, 1)
     end
+    -- Outpost capture time or Settlement siege prerequisites (decision 0053).
+    if info and info.detail then tooltip:AddLine(info.detail, 0.8, 0.8, 0.8) end
     if info and (info.nH or 0) + (info.nA or 0) > 0 then
       tooltip:AddDoubleLine("Players inside", "|cffe64033" .. info.nH .. " Horde|r  |cff408cff"
         .. info.nA .. " Alliance|r", 0.8, 0.8, 0.8, 1, 1, 1)
     end
     if info and info.here then tooltip:AddLine("You are here", 0.3, 1, 0.3) end
+    -- Resource POIs: their shared stock, never an owner (decision 0048).
+    local stock = PC.Stock and PC.Stock.TooltipInfo and PC.Stock:TooltipInfo(area.id)
+    if stock then
+      tooltip:AddDoubleLine(stock.name .. " stock", stock.level .. " / " .. stock.capacity, 0.8, 0.8, 0.8, 1, 1, 1)
+      tooltip:AddLine(stock.status, 1, 1, 1)
+      if stock.here then tooltip:AddLine("You are here", 0.3, 1, 0.3) end
+    end
+    -- Scouting (decision 0050): the enemy sees a scout coming, never its sender.
+    local scout = PC.Scout and PC.Scout.TooltipInfo and PC.Scout:TooltipInfo(area.id)
+    if scout then
+      if scout.discovered then
+        tooltip:AddDoubleLine("Discovered", FormatDuration(scout.discovered) .. " left", 0.8, 0.8, 0.8, 0.3, 1, 0.3)
+        local view = scout.garrison
+        if view then
+          local units = {}
+          local index = 1
+          while index <= table.getn(PC.Garrison.UNIT_ORDER) do
+            local key = PC.Garrison.UNIT_ORDER[index]
+            table.insert(units, view[key] .. " " .. PC.Garrison:Name(key, view.owner))
+            index = index + 1
+          end
+          tooltip:AddLine("Garrison: " .. table.concat(units, ", "), 1, 1, 1)
+          tooltip:AddLine("Seen " .. FormatDuration(scout.seen) .. " ago", 0.8, 0.8, 0.8)
+        else
+          tooltip:AddLine("Garrison: no state received yet", 0.8, 0.8, 0.8)
+        end
+      end
+      if scout.allied then
+        tooltip:AddDoubleLine("Allied scout", "arrives in " .. FormatDuration(scout.allied), 0.8, 0.8, 0.8, 1, 1, 1)
+      end
+      if scout.enemy then
+        tooltip:AddDoubleLine("Enemy scout", "arrives in " .. FormatDuration(scout.enemy), 0.8, 0.8, 0.8, 1, 0.4, 0.4)
+      end
+      if scout.exposed then
+        tooltip:AddDoubleLine("Scouted by the enemy", FormatDuration(scout.exposed) .. " left", 0.8, 0.8, 0.8, 1, 0.4, 0.4)
+      end
+    end
+    -- Armies (decision 0052): the exact composition only for one's own faction.
+    local attack = PC.Attack and PC.Attack.TooltipInfo and PC.Attack:TooltipInfo(area.id)
+    if attack then
+      if attack.allied then
+        tooltip:AddDoubleLine("Allied army", "arrives in " .. FormatDuration(attack.allied.left), 0.8, 0.8, 0.8, 1, 1, 1)
+        tooltip:AddLine(attack.allied.army, 1, 1, 1)
+      end
+      if attack.enemy then
+        tooltip:AddDoubleLine("Enemy army", "arrives in " .. FormatDuration(attack.enemy), 0.8, 0.8, 0.8, 1, 0.4, 0.4)
+      end
+      if attack.pending then tooltip:AddLine("Battle waiting to be resolved", 1, 0.8, 0.3) end
+      if attack.locked then
+        tooltip:AddDoubleLine("Reinforcements locked", FormatDuration(attack.locked) .. " left", 0.8, 0.8, 0.8, 1, 0.8, 0.3)
+      end
+    end
     local hint = Map.TYPE_HINTS[area.type]
     if hint then tooltip:AddLine(hint, 0.8, 0.8, 0.8, 1) end
     local mobs = table.getn(area.requiredMobIds or {})

@@ -180,10 +180,22 @@ end
 function Hunting:Adopt(st, f, source)
   st.owner, st.generation = f.owner, f.generation
   st.challenger, st.progress, st.ver = f.challenger, f.progress, f.ver
-  st.known = true
+  st.known, st.provisional = true, nil
   st.replyAt = nil
   self.dirty = true
   if FACTION_KEYS[f.owner] then Capture:MergeOwner(st.id, f.owner, f.generation, source) end
+end
+
+-- A promoted hint (decision 0038): the bar restarts at rest under the new owner,
+-- provisional, so later kills of that generation apply on top of it.
+function Hunting:OnPromoted(id, owner, generation)
+  local st = self:GetState(id)
+  if st.generation >= generation then return end
+  st.owner, st.generation = owner, generation
+  st.challenger, st.progress, st.ver = "-", 0, 0
+  st.known, st.provisional = true, true
+  st.replyAt = nil
+  self.dirty = true
 end
 
 -- Remembers a kill GUID; false when the same kill was already counted.
@@ -211,8 +223,24 @@ function Hunting:Remember(guid, now)
 end
 
 -- Applies one kill to the local state, then lets a peer that is ahead replace it.
-function Hunting:Credit(id, side, guid, claimed, now, source)
+-- The capturing kill: the killer's bar at rest, owned by its faction, one
+-- generation above ours. Anything further is a capture we did not see.
+local function Capturing(claimed, side, generation)
+  return claimed.generation == generation + 1 and claimed.ver == 0 and claimed.owner == side
+    and claimed.challenger == "-"
+end
+
+-- sender: the chat sender of a K, nil for a local kill.
+function Hunting:Credit(id, side, guid, claimed, now, source, sender)
   local st = self:GetState(id)
+  if claimed and claimed.generation > st.generation and not Capturing(claimed, side, st.generation) then
+    -- A generation jump is only a hint (decision 0038): the bar does not move.
+    self:Remember(guid, now)
+    if sender and FACTION_KEYS[claimed.owner] then
+      Capture:NoteHint(id, sender, claimed.owner, claimed.generation, now)
+    end
+    return nil, false
+  end
   if not self:Remember(guid, now) then
     if claimed and Validate(claimed) and Newer(claimed, st) then self:Adopt(st, claimed, source) end
     return nil, false
@@ -230,6 +258,7 @@ function Hunting:Credit(id, side, guid, claimed, now, source)
   if st.generation > previousGeneration then
     event = "CAPTURED"
     if FACTION_KEYS[st.owner] then Capture:MergeOwner(id, st.owner, st.generation, source) end
+    Capture:ClearHints(id)
   end
   if event == "START" then
     Capture:HandleEvent(id, "START", side, now)
@@ -261,6 +290,11 @@ function Hunting:OnUnitDied(rawGuid)
   local ok, reason = self:Qualify(guid, entry)
   if self.here then self.last = { guid = guid, entry = entry, ok = ok, reason = reason } end
   if not ok then return false end
+  -- A kill nobody could hear of must not move the local bar either.
+  if not Capture:CanTalk() then
+    self.last.ok, self.last.reason = false, Capture.LEVEL_REASON
+    return false
+  end
   local faction = Capture:MyFaction()
   if not faction then
     self.last.ok, self.last.reason = false, "faction unknown"
@@ -310,7 +344,10 @@ function Hunting:OnMessage(kind, parts, sender, now)
 
   if kind == "HQ" then
     if table.getn(parts) ~= 1 then return Capture:Reject("bad HQ", sender) end
-    if st.known and not st.replyAt then st.replyAt = now + REPLY_DELAY + math.random() * REPLY_SPREAD end
+    -- A provisional bar came from a relay: never relayed again (decision 0038).
+    if st.known and not st.provisional and not st.replyAt then
+      Capture:ScheduleReply(st, now + REPLY_DELAY + math.random() * REPLY_SPREAD)
+    end
     return true
   end
 
@@ -318,13 +355,15 @@ function Hunting:OnMessage(kind, parts, sender, now)
     if table.getn(parts) ~= 6 then return Capture:Reject("bad H", sender) end
     local f = ParseClaim(parts, 2)
     if not f then return Capture:Reject("bad H state", sender) end
-    st.replyAt = nil
-    if Newer(f, st) or (not st.known and not (f.generation < st.generation)) then
-      local previousGeneration = st.generation
-      self:Adopt(st, f, "PEER")
-      if st.generation > previousGeneration and FACTION_KEYS[st.owner] then
-        Capture:HandleEvent(id, "CAPTURED", st.owner, now, st.generation)
-      end
+    -- An H is always a relayed answer: a hint, never a confirmed owner nor an
+    -- effect (decision 0038). Only the bar of the generation we hold moves.
+    Capture:SeeReply(st, sender, f.owner == st.owner and f.generation == st.generation)
+    if FACTION_KEYS[f.owner] then Capture:NoteHint(id, sender, f.owner, f.generation, now) end
+    if f.generation == st.generation and f.owner == st.owner and (not st.known or Newer(f, st)) then
+      local provisional = not st.known or st.provisional
+      st.challenger, st.progress, st.ver = f.challenger, f.progress, f.ver
+      st.known, st.provisional = true, provisional or nil
+      self.dirty = true
     end
     return true
   end
@@ -335,10 +374,13 @@ function Hunting:OnMessage(kind, parts, sender, now)
   local f = ParseClaim(parts, 4)
   if not FACTION_KEYS[faction] or not guid or not f then return Capture:Reject("bad K", sender) end
   if f.generation < st.generation then return Capture:Reject("old generation", sender) end
-  self:Credit(id, faction, guid, f, now, "PEER")
+  local generation = st.generation
+  self:Credit(id, faction, guid, f, now, "PEER", sender)
   -- Only the capturing kill leaves the sender's bar at rest, owned by its
-  -- faction, at version 0 (Apply); the H relay is never a witness.
-  if f.ver == 0 and f.owner == faction and f.challenger == "-" and PC.Witness then
+  -- faction, at version 0 (Apply); the H relay is never a witness, nor a
+  -- generation jump kept as a hint (decision 0038).
+  if f.ver == 0 and f.owner == faction and f.challenger == "-" and f.generation <= generation + 1
+      and PC.Witness then
     PC.Witness:Note(sender, "CAPTURED", id, f.generation)
   end
   return true
@@ -416,7 +458,12 @@ function Hunting:UpdateMap()
       if st and st.owner == owner and st.challenger ~= "-" and st.progress >= 500 then
         half = FACTION_KEYS[st.challenger]
       end
-      map:SetCaptureView(id, FACTION_KEYS[owner], half)
+      local hint = Capture:BestHint(id, Now())
+      if hint then
+        map:SetCaptureView(id, FACTION_KEYS[hint.owner], nil, true)
+      else
+        map:SetCaptureView(id, FACTION_KEYS[owner], half)
+      end
     end
     index = index + 1
   end
@@ -495,10 +542,12 @@ function Hunting:GetHud()
   local view = Copy(st)
   view.mode = "H"
   local warning = nil
-  if not self:Area(here.id) then
+  if not Capture:CanTalk() then
+    warning = "You cannot capture: " .. Capture.LEVEL_REASON
+  elseif not self:Area(here.id) then
     warning = "No creature listed here: cannot be captured yet"
   elseif not self:CanDetectDeaths() then
-    warning = "nampower not detected: launch the game with the Octo launcher"
+    warning = "Enable NamPower in the Octo launcher"
   end
   return {
     hunting = true,

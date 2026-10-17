@@ -6,7 +6,7 @@ local HUD = {}
 
 PC.CaptureHUD = HUD
 
--- Top-of-screen capture bar shown while the player stands in an OUTPOST, plus
+-- Top-of-screen capture bar shown while the player stands in an OUTPOST or a SETTLEMENT, plus
 -- the alert sent to the defending faction (docs/capture.md, Affichage).
 local UPDATE_INTERVAL = 0.1
 local WIDTH = 280
@@ -17,6 +17,7 @@ local COLORS = {
   H = { 0.90, 0.12, 0.08 },
   A = { 0.10, 0.42, 1.00 },
   N = { 0.45, 0.45, 0.45 },
+  R = { 0.95, 0.75, 0.20 },
 }
 
 local function GetGlobal(name)
@@ -48,8 +49,10 @@ local function NewText(frame, template, point, y)
   return text
 end
 
-local function NewFill(bar, color)
-  local texture = bar:CreateTexture(nil, "ARTWORK")
+-- 1.12 has no texture sublevels: the grey base must sit in a lower layer
+-- than the faction fills, or it may be drawn over them.
+local function NewFill(bar, color, layer)
+  local texture = bar:CreateTexture(nil, layer or "ARTWORK")
   texture:SetTexture(BAR_TEXTURE)
   texture:SetVertexColor(color[1], color[2], color[3], 1)
   texture:SetHeight(BAR_HEIGHT)
@@ -63,7 +66,7 @@ function HUD:Build()
   local ok, frame = pcall(create, "Frame", "PandaConquestCaptureHUD", UIParent)
   if not ok or not frame then return nil end
   frame:SetWidth(WIDTH)
-  frame:SetHeight(70)
+  frame:SetHeight(84)
   frame:SetPoint("TOP", UIParent, "TOP", 0, -70)
 
   local background = frame:CreateTexture(nil, "BACKGROUND")
@@ -73,13 +76,16 @@ function HUD:Build()
   self.title = NewText(frame, "GameFontNormal", "TOP", -6)
   self.mode = NewText(frame, "GameFontHighlightSmall", "TOP", -40)
   self.info = NewText(frame, "GameFontHighlightSmall", "TOP", -53)
+  -- Why an Outpost takes 3 to 20 minutes, or what a siege still needs (WP10).
+  self.detail = NewText(frame, "GameFontHighlightSmall", "TOP", -67)
+  self.detail:SetTextColor(0.8, 0.8, 0.8)
 
   local bar = create("Frame", nil, frame)
   bar:SetWidth(BAR_WIDTH)
   bar:SetHeight(BAR_HEIGHT)
   bar:SetPoint("TOP", frame, "TOP", 0, -23)
   self.bar = bar
-  self.neutral = NewFill(bar, COLORS.N)
+  self.neutral = NewFill(bar, COLORS.N, "BACKGROUND")
   self.neutral:SetAllPoints(bar)
   self.horde = NewFill(bar, COLORS.H)
   self.horde:SetPoint("LEFT", bar, "LEFT", 0, 0)
@@ -133,7 +139,8 @@ function HUD:VersionNotice(data)
 end
 
 function HUD:Update()
-  local data = Capture and (Capture:GetHud() or (PC.Hunting and PC.Hunting:GetHud()))
+  local data = Capture and (Capture:GetHud() or (PC.Hunting and PC.Hunting:GetHud())
+    or (PC.Stock and PC.Stock:GetHud()))
   local notice = self:VersionNotice(data)
   local frame = self.frame or (data and self:Build())
   if not frame then return end
@@ -141,6 +148,38 @@ function HUD:Update()
     frame:Hide()
     return
   end
+  if self.stock then self.stock:Hide() end
+  self.detail:SetText("")
+
+  if data.resource then
+    -- A resource POI is never captured: one gold bar for its shared stock.
+    local stock = data.resource
+    if not self.stock then
+      self.stock = NewFill(self.bar, COLORS.R)
+      self.stock:SetPoint("LEFT", self.bar, "LEFT", 0, 0)
+    end
+    self.horde:Hide()
+    self.alliance:Hide()
+    SetFill(self.stock, stock.capacity > 0 and stock.level / stock.capacity or 0)
+    self.title:SetText(AreaName(data.area) .. " - " .. stock.name)
+    self.mode:SetText("Stock " .. stock.level .. " / " .. stock.capacity .. " - " .. stock.status)
+    self.info:SetText("Your " .. stock.resource .. ": " .. data.owned .. " / " .. data.cap)
+    if data.reason == Capture.LEVEL_REASON then
+      self.warning:SetText("You cannot gather: " .. data.reason)
+      self.warning:Show()
+    elseif data.status == "NC" or not data.status then
+      self.warning:SetText("You are not gathering: " .. tostring(data.reason or "unknown"))
+      self.warning:Show()
+    elseif notice then
+      self.warning:SetText(notice)
+      self.warning:Show()
+    else
+      self.warning:Hide()
+    end
+    frame:Show()
+    return
+  end
+
   local view = data.view
   local owner = view and view.owner or Capture:GetOwner(data.id)
   self.title:SetText(AreaName(data.area) .. " - " .. FactionName(owner))
@@ -182,7 +221,10 @@ function HUD:Update()
     self.info:SetText("")
   end
 
-  if data.status == "NC" or not data.status then
+  if data.reason == Capture.LEVEL_REASON then
+    self.warning:SetText("You cannot capture: " .. data.reason)
+    self.warning:Show()
+  elseif data.status == "NC" or not data.status then
     self.warning:SetText("You are not counted: " .. tostring(data.reason or "unknown"))
     self.warning:Show()
   elseif notice then
@@ -191,6 +233,7 @@ function HUD:Update()
   else
     self.warning:Hide()
   end
+  self.detail:SetText(data.detail or "")
   frame:Show()
 end
 

@@ -67,10 +67,10 @@ end
 function Version:Text()
   if not self.newest then return nil end
   if self:Incompatible() then
-    return "pandaConquest " .. tostring(PC.version) .. " is outdated: players on " .. self.newest
+    return "PandaConquest " .. tostring(PC.version) .. " is outdated: players on " .. self.newest
       .. " no longer see your captures. Update the addon."
   end
-  return "pandaConquest " .. tostring(PC.version) .. " is outdated: version " .. self.newest
+  return "PandaConquest " .. tostring(PC.version) .. " is outdated: version " .. self.newest
     .. " is available. Please update."
 end
 

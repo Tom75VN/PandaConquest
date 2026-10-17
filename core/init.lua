@@ -2,7 +2,7 @@ PandaConquest = PandaConquest or {}
 
 local PC = PandaConquest
 
-PC.name = "pandaConquest"
+PC.name = "PandaConquest"
 -- Same value as ## Version in the .toc (checked by tools/smoke.py). Every
 -- channel line carries it so older builds learn that they are outdated.
 -- Changed only by tools/release.py prepare, once per push (decision 0035).
@@ -28,7 +28,7 @@ function PC.Epoch()
 end
 
 function PC.Print(message)
-  local text = "|cfff5ae0apandaConquest:|r " .. tostring(message)
+  local text = "|cfff5ae0aPandaConquest:|r " .. tostring(message)
   if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
     DEFAULT_CHAT_FRAME:AddMessage(text)
   end

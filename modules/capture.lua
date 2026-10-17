@@ -9,6 +9,11 @@ local Capture = {
   quotaCount = 0,
   alerts = {},
   captured = {},
+  hints = {},
+  -- Sender faction for the hint quorum. Only the chat language may fill it,
+  -- once risk B12 is measured on OctoWoW; empty until then (decision 0038).
+  senderFactions = {},
+  promoted = 0,
   listeners = {},
   here = nil,
   sent = 0,
@@ -21,12 +26,21 @@ local Capture = {
 
 PC.Capture = Capture
 
--- OUTPOST capture (docs/capture.md, decision 0012). Progress is in thousandths
--- of the challenger's share. Modes: R rest, P push, C contested, D return.
+-- OUTPOST and SETTLEMENT capture (docs/capture.md, decisions 0012, 0053).
+-- Progress is in thousandths of the challenger's share. Modes: R rest, P push,
+-- C contested or frozen, D return.
 local CAPTURE_DURATION = 180
 local DECAY_DURATION = 360
-local FULL_RATE = 1000 / CAPTURE_DURATION
-local HALF_RATE = 1000 / DECAY_DURATION
+-- Each attempt carries its own full-bar duration, fixed when it starts and
+-- announced in S (decision 0053): an Outpost from its garrison's defense,
+-- 180 to 1,200 s (decision 0047); a Settlement always 600 s. An empty area
+-- returns at half the attempt's speed.
+local MAX_DURATION = 1200
+local SETTLEMENT_DURATION = 600
+-- A Settlement attempt needs two attackers to open and to advance.
+local SIEGE_ATTACKERS = 2
+-- Plausibility bound: the fastest attempt.
+local MAX_RATE = 1000 / CAPTURE_DURATION
 local PRESENCE_INTERVAL = 10
 local PRESENCE_TTL = 25
 -- A defender of an idle POI it owns, with no rival in sight, slows down; each
@@ -36,11 +50,11 @@ local PRESENCE_REST_TTL = 75
 -- Alone at rest, nobody counts on it but distant observers (decision 0034).
 local PRESENCE_LONE_INTERVAL = 60
 local PRESENCE_LONE_TTL = 150
-local STATE_INTERVAL = 5
+-- A busy authority repeats its S every 30 s, and at once on a transition or a
+-- recount; no 5 % steps (decision 0041). Three intervals of silence, as before.
+local STATE_INTERVAL = 30
 local MIN_BROADCAST_GAP = 1
--- The authority also broadcasts each time the bar crosses a 5 % step (decision 0023).
-local PROGRESS_STEP = 50
-local AUTHORITY_SILENCE = 15
+local AUTHORITY_SILENCE = 90
 local ENTRY_GRACE = 3.5
 local TICK_INTERVAL = 0.25
 local ELIGIBILITY_INTERVAL = 1
@@ -49,13 +63,34 @@ local ALERT_COOLDOWN = 60
 local PLAUSIBILITY_SLACK = 30
 local MAX_PRESENCE_PER_POI = 40
 -- Incoming quota per sender and 10 s window (decision 0029). The total equals
--- what the send gate can emit (one message per 0.25 s, so 40) plus 20 % for
--- delivery jitter: an honest client is never refused. The per-kind limits
+-- what a plain 0.25 s gate could emit (40) plus 20 % for delivery jitter, above
+-- the current gate (6 sends then a 1.1 s pause, ~26, decision 0040): an honest
+-- client is never refused. The per-kind limits
 -- bound the kinds a liar could abuse: kills (risk B11) and requests, whose
 -- answers every peer prepares (risk B8).
 local QUOTA_WINDOW = 10
 local QUOTA_TOTAL = 48
-local QUOTA_BY_KIND = { S = 40, P = 20, Q = 6, HQ = 6, H = 10, K = 20 }
+-- X: shared stock of a resource POI (modules/stock.lua, decision 0048).
+-- G, GD, GQ: garrison state, donation request and query (modules/garrison.lua,
+-- decision 0049).
+-- SC, SQ, SL: scouting order, catch-up request and relayed scout
+-- (modules/scout.lua, decision 0050).
+-- AC, AQ, AL, AR: attack order, catch-up request, relayed attack and battle
+-- result (modules/attack.lua, decision 0052).
+local QUOTA_BY_KIND = {
+  S = 40, P = 20, Q = 6, HQ = 6, H = 10, K = 20, OD = 4, OL = 12, X = 20, G = 20, GD = 6, GQ = 6,
+  SC = 6, SQ = 6, SL = 20, AC = 6, AQ = 6, AL = 20, AR = 10,
+}
+-- Owner claims nobody here saw happen (decision 0038): relayed S and H, OL
+-- catch-up lines, K beyond the next capture. They are hints, never confirmed
+-- until enough distinct senders agree. Values proposed, not measured.
+local HINT_SENDERS = 4
+local HINT_TTL = 900
+local HINT_JUMP = 10
+-- Rule R14 with two answers: a pending reply waits for two matching answers
+-- from distinct senders, or four of any kind, before it is dropped.
+local REPLY_MATCHES = 2
+local REPLY_ANY = 4
 local MAX_QUOTA_SENDERS = 200
 local SCHEMA = 1
 local MAX_ARCHIVED_LEVELS = 3
@@ -63,7 +98,8 @@ local CAMPAIGN = "permanent"
 
 Capture.CAPTURE_DURATION = CAPTURE_DURATION
 Capture.DECAY_DURATION = DECAY_DURATION
-Capture.PROGRESS_STEP = PROGRESS_STEP
+Capture.MAX_DURATION = MAX_DURATION
+Capture.SETTLEMENT_DURATION = SETTLEMENT_DURATION
 
 local FACTION_KEYS = { H = "HORDE", A = "ALLIANCE" }
 local FACTION_CODES = { HORDE = "H", ALLIANCE = "A" }
@@ -89,6 +125,10 @@ Capture.FACTION_NAMES = FACTION_NAMES
 -- not detected); AFK always comes from system messages.
 local MOUNT_TEXTURES = { "ability_mount_", "inv_misc_foot_kodo", "qirajicrystal", "spell_nature_swiftness" }
 local STEALTH_TEXTURES = { "ability_stealth", "ability_ambush", "invisibilty", "invisibility" }
+-- The server refuses channel chat below this level: such a player could not
+-- share anything, so it takes no part in any capture (decision 0039).
+local MIN_CHANNEL_LEVEL = 5
+Capture.LEVEL_REASON = "below level " .. MIN_CHANNEL_LEVEL .. ", channel chat locked"
 
 local function GetGlobal(name)
   if getglobal then return getglobal(name) end
@@ -154,28 +194,40 @@ local function Copy(st)
   return {
     id = st.id, owner = st.owner, generation = st.generation,
     challenger = st.challenger, progress = st.progress, mode = st.mode, dir = st.dir,
-    nH = st.nH, nA = st.nA, epoch = st.epoch, seq = st.seq,
+    nH = st.nH, nA = st.nA, epoch = st.epoch, seq = st.seq, dur = st.dur, siege = st.siege,
   }
 end
 
+-- Full-bar speed of the attempt, in thousandths per second.
+local function Rate(st)
+  return 1000 / (st.dur or CAPTURE_DURATION)
+end
+
+local function HalfRate(st)
+  return 500 / (st.dur or CAPTURE_DURATION)
+end
+
 -- Moves a state forward by dt seconds in its current mode. Observers pass
--- allowCapture=false: only the authority completes a capture.
+-- allowCapture=false: only the authority completes a capture. A Settlement
+-- (siege) never opens an attempt here: only its authority does, once the
+-- prerequisites hold (Capture:SiegeMode, decision 0053).
 local function Advance(st, dt, allowCapture)
   local event = nil
   local guard = 0
+  local rate, half = Rate(st), HalfRate(st)
   while dt > 0 and guard < 4 do
     guard = guard + 1
     if st.mode == "P" and FACTION_KEYS[st.dir] then
       local side = st.dir
       if st.challenger == "-" then
-        if side == st.owner then return event end
+        if side == st.owner or st.siege then return event end
         st.challenger = side
         st.progress = 0
       end
       if st.challenger == side then
-        local need = (1000 - st.progress) / FULL_RATE
+        local need = (1000 - st.progress) / rate
         if dt < need then
-          st.progress = st.progress + FULL_RATE * dt
+          st.progress = st.progress + rate * dt
           return event
         end
         if not allowCapture then
@@ -191,9 +243,9 @@ local function Advance(st, dt, allowCapture)
       else
         -- The owner defends, or on a neutral POI the other faction must first
         -- bring the challenger back to 0 before building its own share.
-        local need = st.progress / FULL_RATE
+        local need = st.progress / rate
         if dt < need then
-          st.progress = st.progress - FULL_RATE * dt
+          st.progress = st.progress - rate * dt
           return event
         end
         dt = dt - need
@@ -202,9 +254,9 @@ local function Advance(st, dt, allowCapture)
       end
     elseif st.mode == "D" then
       if st.challenger ~= "-" then
-        local need = st.progress / HALF_RATE
+        local need = st.progress / half
         if dt < need then
-          st.progress = st.progress - HALF_RATE * dt
+          st.progress = st.progress - half * dt
           return event
         end
       end
@@ -275,22 +327,140 @@ end
 
 -- Catalogue and ownership -----------------------------------------------------
 
+-- A POI with the timed presence bar: an OUTPOST or, since decision 0053, a
+-- SETTLEMENT (its attempts gated by Capture:SiegeMode).
+local TIMED_TYPES = { OUTPOST = true, SETTLEMENT = true }
+
 function Capture:Outpost(id)
   local map = PC.Map
   local area = map and type(id) == "string" and map.areas[id] or nil
-  if area and area.type == "OUTPOST" and area.enabled then return area end
+  if area and TIMED_TYPES[area.type] and area.enabled then return area end
   return nil
 end
 
--- OUTPOST and HUNTING_GROUNDS share one owner registry; only outposts use the
--- timed bar below, hunting grounds use modules/hunting.lua (decision 0026).
+-- OUTPOST, SETTLEMENT and HUNTING_GROUNDS share one owner registry; hunting
+-- grounds use modules/hunting.lua instead of the timed bar (decision 0026).
 function Capture:Capturable(id)
   local map = PC.Map
   local area = map and type(id) == "string" and map.areas[id] or nil
-  if area and area.enabled and (area.type == "OUTPOST" or area.type == "HUNTING_GROUNDS") then
+  if area and area.enabled and (TIMED_TYPES[area.type] or area.type == "HUNTING_GROUNDS") then
     return area
   end
   return nil
+end
+
+-- Objectives linked to a Settlement (decision 0053): every enabled OUTPOST
+-- and HUNTING_GROUNDS of its map, sorted by id.
+function Capture:LinkedObjectives(id)
+  local links = {}
+  local map = PC.Map
+  local settlement = map and map.areas[id]
+  if not settlement or settlement.type ~= "SETTLEMENT" then return links end
+  local other, area
+  for other, area in pairs(map.areas) do
+    if type(area) == "table" and area.enabled and area.map == settlement.map
+        and (area.type == "OUTPOST" or area.type == "HUNTING_GROUNDS") then
+      table.insert(links, other)
+    end
+  end
+  table.sort(links)
+  return links
+end
+
+-- Full-bar duration of an Outpost attempt from its garrison's total defense
+-- (decision 0047): 180 + floor(1020 x DEF x size_best / (12 x DEF_best)),
+-- capped at 1,200, where DEF_best / size_best is the best DEF per Unit Size.
+function Capture.DefenseDuration(defense)
+  local units = PC.Army and PC.Army.UNITS
+  if not units or defense <= 0 then return CAPTURE_DURATION end
+  local bestDef, bestSize = 0, 1
+  local key, unit
+  for key, unit in pairs(units) do
+    if (unit.def or 0) > 0 and unit.size and unit.def * bestSize > bestDef * unit.size then
+      bestDef, bestSize = unit.def, unit.size
+    end
+  end
+  if bestDef <= 0 then return CAPTURE_DURATION end
+  local capacity = PC.Garrison and PC.Garrison.OUTPOST_CAPACITY or 12
+  local extra = math.floor((MAX_DURATION - CAPTURE_DURATION) * defense * bestSize / (capacity * bestDef))
+  return math.min(MAX_DURATION, CAPTURE_DURATION + extra)
+end
+
+-- Defense and unit count of the garrison as this client knows it, read
+-- without creating or wiping a garrison record; an older generation is empty.
+function Capture:GarrisonDefense(id)
+  local garrison = PC.Garrison
+  local units = PC.Army and PC.Army.UNITS
+  if not garrison or not units then return 0, 0 end
+  local g = garrison.states and garrison.states[id]
+  local _, generation = self:GetOwner(id)
+  if not g or g.gen ~= generation then return 0, 0 end
+  local defense = g.f * units.FOOTMAN.def + g.r * units.RIFLEMAN.def + g.m * units.MORTAR.def
+  return defense, g.f + g.r + g.m
+end
+
+-- Duration the next attempt on this POI would take, fixed when it opens.
+function Capture:AttemptDuration(id)
+  local area = self:Outpost(id)
+  if area and area.type == "SETTLEMENT" then return SETTLEMENT_DURATION end
+  local owner = self:GetOwner(id)
+  if not FACTION_KEYS[owner] then return CAPTURE_DURATION end
+  return Capture.DefenseDuration((self:GarrisonDefense(id)))
+end
+
+-- Why faction side cannot open a Settlement attempt now, or nil (decision
+-- 0053): every linked objective held by side, an empty garrison and, when
+-- the other faction holds it, a valid discovery by side. The two attackers
+-- are counted by SiegeMode. Checked only when an attempt opens.
+function Capture:SiegeBlocked(id, side, now)
+  local owner = self:GetOwner(id)
+  if owner == side then return "already held by the " .. FACTION_NAMES[side] end
+  local links = self:LinkedObjectives(id)
+  local index = 1
+  while index <= table.getn(links) do
+    if self:GetOwner(links[index]) ~= side then
+      local area = PC.Map.areas[links[index]]
+      return (area.label or links[index]) .. " is not held by the " .. FACTION_NAMES[side]
+    end
+    index = index + 1
+  end
+  local _, units = self:GarrisonDefense(id)
+  if units > 0 then return "its garrison still has " .. units .. " defender(s)" end
+  if FACTION_KEYS[owner] then
+    if not PC.Scout or not PC.Scout:Discovery(id, side, now) then
+      return "not scouted by the " .. FACTION_NAMES[side]
+    end
+  end
+  return nil
+end
+
+-- Mode and direction of a Settlement's bar (decision 0053). With no attempt,
+-- one opens only toward a majority of at least two attackers that meets the
+-- prerequisites. During an attempt: two attackers ahead push, one alone with
+-- no defender freezes it (no time limit), defenders ahead push back at full
+-- speed, a non-zero tie freezes, an empty area returns.
+function Capture:SiegeMode(id, st, nH, nA, now)
+  local counts = { H = nH, A = nA }
+  if st.challenger == "-" then
+    local side = nil
+    if nH > nA then side = "H" elseif nA > nH then side = "A" end
+    if side and side ~= st.owner and counts[side] >= SIEGE_ATTACKERS
+        and not self:SiegeBlocked(id, side, now) then
+      return "P", side
+    end
+    if nH > 0 and nH == nA then return "C", "-" end
+    return "R", "-"
+  end
+  local attacker = st.challenger
+  local defender = attacker == "H" and "A" or "H"
+  local a, d = counts[attacker], counts[defender]
+  if a > d then
+    if a >= SIEGE_ATTACKERS then return "P", attacker end
+    return "C", "-"
+  end
+  if d > a then return "P", defender end
+  if a > 0 then return "C", "-" end
+  return "D", "-"
 end
 
 local function StaticOwner(area)
@@ -429,15 +599,20 @@ function Capture:RestoreProgress(bucket)
       local progress = tonumber(entry.progress)
       local at = tonumber(entry.at)
       local savedEpoch = tonumber(entry.epoch)
+      -- Saves from before decision 0053 carry no duration: 180 s then.
+      local dur = tonumber(entry.dur or CAPTURE_DURATION)
+      if self:Outpost(id).type == "SETTLEMENT" then dur = SETTLEMENT_DURATION end
       if entry.owner == owner and tonumber(entry.generation) == generation
           and (entry.challenger == "H" or entry.challenger == "A") and entry.challenger ~= owner
           and progress and progress > 0 and progress < 1000 and at and at <= epoch
-          and savedEpoch and savedEpoch >= 0 and savedEpoch <= 1000000 then
-        local left = progress - HALF_RATE * (epoch - at)
+          and savedEpoch and savedEpoch >= 0 and savedEpoch <= 1000000
+          and dur and dur >= CAPTURE_DURATION and dur <= MAX_DURATION then
+        dur = Floor(dur)
+        local left = progress - HalfRate({ dur = dur }) * (epoch - at)
         if left > 0 then
           st = self:GetState(id)
           st.owner, st.generation = owner, generation
-          st.challenger, st.progress = entry.challenger, left
+          st.challenger, st.progress, st.dur = entry.challenger, left, dur
           st.mode, st.dir, st.nH, st.nA = "D", "-", 0, 0
           st.epoch = math.max(st.epoch, Floor(savedEpoch))
           st.at, st.lastStateAt = now, now
@@ -462,7 +637,7 @@ function Capture:SaveProgress(now)
     if view.challenger ~= "-" and view.progress > 0 and view.progress < 1000 then
       progress[id] = {
         owner = view.owner, generation = view.generation, challenger = view.challenger,
-        progress = Floor(view.progress), epoch = st.epoch, at = epoch,
+        progress = Floor(view.progress), epoch = st.epoch, at = epoch, dur = view.dur,
       }
     end
   end
@@ -481,15 +656,167 @@ function Capture:MergeOwner(id, owner, generation, source)
   return true
 end
 
+-- Owner hints (decision 0038) ----------------------------------------------------
+-- Per POI, at most HINT_SENDERS claims { sender, generation, owner, at }, at in
+-- local time only. Never persisted, never sent, never used to refuse a state.
+
+local function Beats(id, owner, generation)
+  local currentOwner, currentGeneration = Capture:GetOwner(id)
+  return OwnerWins(owner, generation, currentOwner, currentGeneration)
+end
+
+function Capture:ClearHints(id)
+  self.hints[id] = nil
+end
+
+-- Drops the claims the confirmed registry caught up with, and the expired ones.
+function Capture:PruneHints(id, now)
+  local list = self.hints[id]
+  if not list then return end
+  local kept = {}
+  local index = 1
+  while index <= table.getn(list) do
+    local claim = list[index]
+    if Beats(id, claim.owner, claim.generation) and (not now or now - claim.at < HINT_TTL) then
+      table.insert(kept, claim)
+    end
+    index = index + 1
+  end
+  self.hints[id] = table.getn(kept) > 0 and kept or nil
+end
+
+-- One claim of `sender`, read from the chat event (rule R1). A sender replaces
+-- its own claim; a full table drops the oldest one.
+function Capture:NoteHint(id, sender, owner, generation, now)
+  if not self:Capturable(id) or not FACTION_KEYS[owner] or type(generation) ~= "number"
+      or generation < 1 or not sender or sender == self:Me() then
+    return false
+  end
+  local list = self.hints[id] or {}
+  local index = 1
+  while index <= table.getn(list) do
+    if list[index].sender == sender then
+      table.remove(list, index)
+    else
+      index = index + 1
+    end
+  end
+  if not Beats(id, owner, generation) then
+    self.hints[id] = table.getn(list) > 0 and list or nil
+    return false
+  end
+  table.insert(list, { sender = sender, owner = owner, generation = generation, at = now })
+  while table.getn(list) > HINT_SENDERS do
+    -- The list keeps arrival order: at equal time, the first arrived leaves.
+    local oldest = 1
+    index = 2
+    while index <= table.getn(list) do
+      if list[index].at < list[oldest].at then oldest = index end
+      index = index + 1
+    end
+    table.remove(list, oldest)
+  end
+  self.hints[id] = list
+  self:PromoteHint(id, owner, generation, now)
+  return true
+end
+
+-- Q1: two distinct senders of two known factions; Q2: three distinct senders.
+-- A jump of more than HINT_JUMP generations needs one sender more.
+function Capture:Quorum(id, owner, generation)
+  local list = self.hints[id]
+  if not list then return false end
+  local count, factions = 0, {}
+  local index = 1
+  while index <= table.getn(list) do
+    local claim = list[index]
+    if claim.owner == owner and claim.generation == generation then
+      count = count + 1
+      local faction = self.senderFactions[claim.sender]
+      if faction then factions[faction] = true end
+    end
+    index = index + 1
+  end
+  local _, currentGeneration = self:GetOwner(id)
+  local extra = generation - currentGeneration > HINT_JUMP and 1 or 0
+  if factions.H and factions.A and count >= 2 + extra then return true end
+  return count >= 3 + extra
+end
+
+-- A promoted hint enters the registry as PEER, without any effect (rule R4).
+function Capture:PromoteHint(id, owner, generation, now)
+  if not self:Quorum(id, owner, generation) then return false end
+  if not self:MergeOwner(id, owner, generation, "PEER") then return false end
+  self.promoted = self.promoted + 1
+  Record("CAPTURE_HINT_PROMOTED", { id = id, owner = owner, generation = generation })
+  if PC.Hunting and PC.Hunting:Area(id) then PC.Hunting:OnPromoted(id, owner, generation) end
+  self:PruneHints(id, nil)
+  return true
+end
+
+-- The most supported claim that beats the registry: owner, count, age.
+function Capture:BestHint(id, now)
+  local list = self.hints[id]
+  if not list then return nil end
+  local bestOwner, bestGeneration, bestCount, bestAt
+  local index = 1
+  while index <= table.getn(list) do
+    local claim = list[index]
+    if Beats(id, claim.owner, claim.generation) and now - claim.at < HINT_TTL then
+      local count, newest = 0, claim.at
+      local other = 1
+      while other <= table.getn(list) do
+        local peer = list[other]
+        if peer.owner == claim.owner and peer.generation == claim.generation then
+          count = count + 1
+          if peer.at > newest then newest = peer.at end
+        end
+        other = other + 1
+      end
+      if not bestCount or count > bestCount or (count == bestCount
+          and OwnerWins(claim.owner, claim.generation, bestOwner, bestGeneration)) then
+        bestOwner, bestGeneration, bestCount, bestAt = claim.owner, claim.generation, count, newest
+      end
+    end
+    index = index + 1
+  end
+  if not bestOwner then return nil end
+  return { owner = bestOwner, generation = bestGeneration, count = bestCount, age = Floor(now - bestAt) }
+end
+
+-- Rule R14 with two answers: `matches` says whether the answer seen carries the
+-- same (generation, owner) as the reply we hold.
+function Capture:SeeReply(st, sender, matches)
+  if not st.replyAt then return end
+  st.replyAny = st.replyAny or {}
+  st.replyMatch = st.replyMatch or {}
+  st.replyAny[sender] = true
+  if matches then st.replyMatch[sender] = true end
+  local any, match = 0, 0
+  local name
+  for name in pairs(st.replyAny) do any = any + 1 end
+  for name in pairs(st.replyMatch) do match = match + 1 end
+  if match >= REPLY_MATCHES or any >= REPLY_ANY then
+    st.replyAt, st.replyAny, st.replyMatch = nil, nil, nil
+  end
+end
+
+function Capture:ScheduleReply(st, at)
+  st.replyAt, st.replyAny, st.replyMatch = at, nil, nil
+end
+
 -- States ----------------------------------------------------------------------
 
 function Capture:GetState(id)
   local st = self.states[id]
   if st then return st end
   local owner, generation = self:GetOwner(id)
+  local area = self:Outpost(id)
+  local siege = area ~= nil and area.type == "SETTLEMENT" or nil
   st = {
     id = id, owner = owner, generation = generation, challenger = "-", progress = 0,
     mode = "R", dir = "-", nH = 0, nA = 0, epoch = 0, seq = 0,
+    dur = siege and SETTLEMENT_DURATION or CAPTURE_DURATION, siege = siege,
     at = Now(), lastStateAt = -1000, lastBroadcastAt = -1000, known = false,
   }
   self.states[id] = st
@@ -734,6 +1061,12 @@ end
 
 local function AlwaysTrue() return true end
 
+-- An unknown level (no API, 0 while loading) does not block.
+function Capture:CanTalk()
+  local ok, level = Call("UnitLevel", "player")
+  return not (ok and type(level) == "number" and level > 0 and level < MIN_CHANNEL_LEVEL)
+end
+
 function Capture:Eligibility()
   if Flag("UnitIsDeadOrGhost") then return "NC", "dead" end
   if Capture.afk then return "NC", "AFK" end
@@ -774,6 +1107,11 @@ end
 -- key lets the send gate replace a queued message that this one supersedes;
 -- priority marks an event message, dropped last by a full send queue.
 function Capture:Send(kind, body, key, priority)
+  if not self:CanTalk() then
+    self.sendFailures = self.sendFailures + 1
+    self.lastSendError = self.LEVEL_REASON
+    return false
+  end
   local p2p = PC.P2PTest
   if not p2p or type(p2p.SendChannelEvent) ~= "function" then
     self.sendFailures = self.sendFailures + 1
@@ -815,14 +1153,8 @@ function Capture:SendState(st, event, age)
   if not event then key = "S," .. st.id end
   return self:Send("S", st.id .. "," .. st.epoch .. "," .. st.seq .. "," .. st.owner
     .. "," .. st.generation .. "," .. st.challenger .. "," .. Floor(st.progress)
-    .. "," .. st.mode .. "," .. st.dir .. "," .. st.nH .. "," .. st.nA
+    .. "," .. st.mode .. "," .. st.dir .. "," .. st.nH .. "," .. st.nA .. "," .. Floor(st.dur or CAPTURE_DURATION)
     .. "," .. (event and EVENT_CODES[event] or "-") .. "," .. Floor(age or 0), key, event ~= nil)
-end
-
--- 5 % step of the challenger's share; "-" while nobody is capturing.
-local function ProgressStep(st)
-  if st.challenger == "-" then return "-" end
-  return st.challenger .. Floor(st.progress / PROGRESS_STEP)
 end
 
 -- Events ----------------------------------------------------------------------
@@ -872,21 +1204,38 @@ function Capture:AuthorityStep(id, now, force)
   local nH, nA = self:Count(id, now)
   local event = Advance(st, now - st.at, true)
   st.at = now
-  local mode, dir = ModeFromCounts(nH, nA, st)
+  if event == "CAPTURED" then
+    self:MergeOwner(id, st.owner, st.generation, "LOCAL")
+  end
+  local mode, dir
+  if st.siege then
+    mode, dir = self:SiegeMode(id, st, nH, nA, now)
+  else
+    mode, dir = ModeFromCounts(nH, nA, st)
+  end
   if not event and mode == "P" and dir ~= st.owner and not (st.mode == "P" and st.dir == dir) then
     event = "START"
   end
   local transition = event ~= nil or mode ~= st.mode or dir ~= st.dir
+  -- While no attempt runs, the next one's duration follows the garrison; it
+  -- is fixed once the attempt opens and travels in S (decision 0053).
+  if st.challenger == "-" then
+    local dur = self:AttemptDuration(id)
+    if dur ~= st.dur then
+      st.dur = dur
+      if mode == "P" and dir ~= st.owner then transition = true end
+    end
+  end
+  -- Only the authority opens a Settlement attempt, prerequisites checked.
+  if st.siege and mode == "P" and st.challenger == "-" and dir ~= st.owner then
+    st.challenger, st.progress = dir, 0
+    Record("SIEGE_OPENED", { id = id, attacker = dir })
+  end
   local recounted = nH ~= st.nH or nA ~= st.nA
-  local step = ProgressStep(st)
-  local stepped = step ~= st.lastStep
   st.mode, st.dir, st.nH, st.nA = mode, dir, nH, nA
   st.lastStateAt = now
-  if event == "CAPTURED" then
-    self:MergeOwner(id, st.owner, st.generation, "LOCAL")
-  end
 
-  -- Busy POIs repeat every 5 s; once idle, one confirmation follows so a lost
+  -- Busy POIs repeat every 30 s; once idle, one confirmation follows so a lost
   -- transition (for example CAPTURED) does not leave observers stale.
   local elapsed = now - st.lastBroadcastAt
   local due
@@ -896,11 +1245,10 @@ function Capture:AuthorityStep(id, now, force)
     st.settled = false
     due = elapsed >= STATE_INTERVAL
   end
-  if force or transition or stepped or (recounted and elapsed >= MIN_BROADCAST_GAP) or due then
+  if force or transition or (recounted and elapsed >= MIN_BROADCAST_GAP) or due then
     if IsIdle(st) and not transition and not force and due then st.settled = true end
     st.seq = st.seq + 1
     st.lastBroadcastAt = now
-    st.lastStep = step
     self:SendState(st, event, 0)
   end
   if event == "START" then
@@ -978,7 +1326,7 @@ end
 
 function Capture:OnPresenceChange(area, previous)
   local now = Now()
-  if previous and previous.type == "OUTPOST" and self.here and self.here.id == previous.id then
+  if previous and self:Outpost(previous.id) and self.here and self.here.id == previous.id then
     self:Leave(previous.id, now)
   end
   if area and self:Outpost(area.id) then
@@ -995,6 +1343,11 @@ function Capture:UpdateEligibility(now, force)
     here.status, here.reason = nil, "faction unknown"
     return
   end
+  -- No status: no presence, never a candidate for authority (Maintain).
+  if not self:CanTalk() then
+    here.status, here.reason = nil, self.LEVEL_REASON
+    return
+  end
   local status, reason = self:Eligibility()
   local changed = status ~= here.status
   here.status, here.reason = status, reason
@@ -1005,11 +1358,9 @@ function Capture:UpdateEligibility(now, force)
   -- sooner. A slower one waits for the P due under the previous cadence.
   local last = here.cadence or "F"
   local woken = CADENCE_RANKS[cadence] < CADENCE_RANKS[last]
-  -- The authority of a busy POI repeats its S at least every 5 s, which keeps
-  -- its presence alive (RefreshPresence): no periodic P then (decision 0034).
-  local st = self.states[here.id]
-  local streaming = st ~= nil and st.authority == me and not IsIdle(st)
-  local due = not streaming and now - here.lastPresenceAt >= CADENCE_INTERVALS[last]
+  -- A busy authority keeps its periodic P: its S every 30 s would outlast the
+  -- 25 s presence a rival caps it to (decision 0041, reverts part of 0034).
+  local due = now - here.lastPresenceAt >= CADENCE_INTERVALS[last]
   if force or changed or woken or due then
     here.lastPresenceAt = now
     here.cadence = cadence
@@ -1078,6 +1429,9 @@ function Capture:DropPresence(id, sender, now)
     st.explicitOut = true
     st.takeoverAt = nil
   end
+  -- The same presence table counts gatherers: release a stock authority too.
+  if PC.Stock then PC.Stock:OnDrop(id, sender) end
+  if PC.Garrison then PC.Garrison:OnDrop(id, sender) end
 end
 
 function Capture:OnPresenceMessage(sender, id, faction, status, now, cadence)
@@ -1097,18 +1451,19 @@ end
 
 function Capture:OnQuery(sender, id, now)
   local st = self.states[id]
-  if not st or not st.known then return true end
+  -- A provisional state came from a relay: never relayed again (decision 0038).
+  if not st or not st.known or st.provisional then return true end
   if st.authority and st.authority == self:Me() then
     self:AuthorityStep(id, now, true)
   elseif not st.replyAt then
-    st.replyAt = now + 0.5 + math.random() * 2.5
+    self:ScheduleReply(st, now + 0.5 + math.random() * 2.5)
   end
   return true
 end
 
 function Capture:CheckPlausible(st, f, now)
   local elapsed = math.max(0, now - st.lastStateAt)
-  local reach = FULL_RATE * elapsed + PLAUSIBILITY_SLACK
+  local reach = MAX_RATE * elapsed + PLAUSIBILITY_SLACK
   if f.owner ~= st.owner then
     if f.generation ~= st.generation + 1 or st.challenger ~= f.owner
         or st.progress + reach < 1000 then
@@ -1134,7 +1489,8 @@ function Capture:OnStateMessage(sender, f, now)
     -- Like a P, even if a rule below refuses the state: a refused authority
     -- must not also lose its presence (decision 0034).
     self:RefreshPresence(id, sender, now)
-    if st.known then
+    -- A provisional state never refuses a live one (decision 0038).
+    if st.known and not st.provisional then
       if f.epoch < st.epoch then return self:Reject("old epoch", sender) end
       if f.epoch == st.epoch then
         -- The producer of the epoch is kept after it leaves, so its late or
@@ -1149,21 +1505,34 @@ function Capture:OnStateMessage(sender, f, now)
         end
       end
     end
-  elseif st.known and f.epoch <= st.epoch then
-    -- A relayed answer only fills in a POI we know nothing newer about.
-    st.replyAt = nil
+  else
+    -- A relayed answer is a hint (decision 0038): it never enters the registry,
+    -- never replaces a known state nor its authority, and never has an effect.
+    self:SeeReply(st, sender, f.owner == st.owner and f.generation == st.generation)
+    if FACTION_KEYS[f.owner] then self:NoteHint(id, sender, f.owner, f.generation, now) end
+    local owner, generation = self:GetOwner(id)
+    if st.known or f.owner ~= owner or f.generation ~= generation then return true end
+    -- Unknown POI, same confirmed owner: a provisional bar for display only.
+    st.owner, st.generation = owner, generation
+    st.challenger, st.progress = f.challenger, f.progress
+    st.mode, st.dir, st.nH, st.nA, st.dur = f.mode, f.dir, f.nH, f.nA, f.dur
+    st.epoch, st.seq = f.epoch, f.seq
+    st.at = now - f.age
+    st.lastStateAt = now - f.age
+    st.known, st.provisional = true, true
+    st.authority, st.epochHolder = nil, nil
     return true
   end
 
   local wasMine = st.authority ~= nil and st.authority == me
   st.owner, st.generation = f.owner, f.generation
   st.challenger, st.progress = f.challenger, f.progress
-  st.mode, st.dir, st.nH, st.nA = f.mode, f.dir, f.nH, f.nA
+  st.mode, st.dir, st.nH, st.nA, st.dur = f.mode, f.dir, f.nH, f.nA, f.dur
   st.epoch, st.seq = f.epoch, f.seq
   st.at = now - f.age
   st.lastStateAt = now - f.age
-  st.known = true
-  st.authority = live and sender or nil
+  st.known, st.provisional = true, nil
+  st.authority = sender
   st.epochHolder = st.authority
   st.takeoverAt = nil
   st.explicitOut = nil
@@ -1172,9 +1541,11 @@ function Capture:OnStateMessage(sender, f, now)
 
   local present = self.here and self.here.id == id
   self:MergeOwner(id, f.owner, f.generation, present and "LOCAL" or "PEER")
-  if live and f.event == "START" then
+  -- A live state of a present authority replaces every hint (decision 0038).
+  self:ClearHints(id)
+  if f.event == "START" then
     self:HandleEvent(id, "START", f.dir, now)
-  elseif live and f.event == "CAPTURED" then
+  elseif f.event == "CAPTURED" then
     self:HandleEvent(id, "CAPTURED", f.owner, now, f.generation)
     -- The authority's own announce, accepted above; never a relayed answer.
     if PC.Witness then PC.Witness:Note(sender, "CAPTURED", id, f.generation) end
@@ -1184,7 +1555,7 @@ end
 
 -- parts: the S fields after the event id, starting with the POI.
 function Capture:ParseState(parts)
-  if table.getn(parts) ~= 13 then return nil, "bad S field count" end
+  if table.getn(parts) ~= 14 then return nil, "bad S field count" end
   local f = {
     id = parts[1],
     epoch = Int(parts[2], 1000000),
@@ -1197,12 +1568,19 @@ function Capture:ParseState(parts)
     dir = parts[9],
     nH = Int(parts[10], MAX_PRESENCE_PER_POI),
     nA = Int(parts[11], MAX_PRESENCE_PER_POI),
-    event = CODE_EVENTS[parts[12]],
-    age = Int(parts[13], 3600),
+    dur = Int(parts[12], MAX_DURATION),
+    event = CODE_EVENTS[parts[13]],
+    age = Int(parts[14], 3600),
   }
   if not f.epoch or not f.seq or not f.generation or not f.progress or not f.nH or not f.nA
-      or not f.age then
+      or not f.dur or not f.age then
     return nil, "bad S number"
+  end
+  -- Attempt duration (decision 0053): 180 to 1,200 s, exactly 600 s for a
+  -- Settlement.
+  local area = self:Outpost(f.id)
+  if f.dur < CAPTURE_DURATION or (area and area.type == "SETTLEMENT" and f.dur ~= SETTLEMENT_DURATION) then
+    return nil, "bad S duration"
   end
   if not OWNERS[f.owner] or not SIDES[f.challenger] or not MODES[f.mode] or not SIDES[f.dir]
       or not f.event then
@@ -1239,6 +1617,27 @@ function Capture:OnMessage(kind, data, senderName, isEcho)
   if kind == "K" or kind == "H" or kind == "HQ" then
     if not PC.Hunting then return self:Reject("hunting unavailable", sender) end
     return PC.Hunting:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "OD" or kind == "OL" then
+    if not PC.Catchup then return self:Reject("catch-up unavailable", sender) end
+    return PC.Catchup:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "G" or kind == "GD" or kind == "GQ" then
+    if not PC.Garrison then return self:Reject("garrison unavailable", sender) end
+    return PC.Garrison:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "SC" or kind == "SQ" or kind == "SL" then
+    if not PC.Scout then return self:Reject("scouting unavailable", sender) end
+    return PC.Scout:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "AC" or kind == "AQ" or kind == "AL" or kind == "AR" then
+    if not PC.Attack then return self:Reject("attacks unavailable", sender) end
+    return PC.Attack:OnMessage(kind, parts, sender, now)
+  end
+  -- Resource POIs: P, Q and X go to the shared stocks (decision 0048).
+  if kind == "X" or (PC.Stock and PC.Stock:Resource(id)) then
+    if not PC.Stock then return self:Reject("stock unavailable", sender) end
+    return PC.Stock:OnMessage(kind, parts, sender, now)
   end
   if not self:Outpost(id) then return self:Reject("unknown outpost", sender) end
 
@@ -1313,7 +1712,12 @@ function Capture:UpdateMap(now)
     local id = map.order[index]
     if self:Outpost(id) then
       local owner, half = self:GetDisplay(id, now)
-      map:SetCaptureView(id, FACTION_KEYS[owner], half and FACTION_KEYS[half] or nil)
+      local hint = self:BestHint(id, now)
+      if hint then
+        map:SetCaptureView(id, FACTION_KEYS[hint.owner], nil, true)
+      else
+        map:SetCaptureView(id, FACTION_KEYS[owner], half and FACTION_KEYS[half] or nil)
+      end
     end
     index = index + 1
   end
@@ -1336,11 +1740,18 @@ function Capture:Tick()
   end
   if not self.lastMapAt or now - self.lastMapAt >= MAP_INTERVAL then
     self.lastMapAt = now
+    local hinted
+    for hinted in pairs(self.hints) do self:PruneHints(hinted, now) end
     self:UpdateMap(now)
     -- Every second, so a disconnect without PLAYER_LOGOUT loses at most that.
     self:SaveProgress(now)
   end
   if PC.Hunting then PC.Hunting:Tick(now) end
+  if PC.Catchup then PC.Catchup:Tick(now) end
+  if PC.Stock then PC.Stock:Tick(now) end
+  if PC.Garrison then PC.Garrison:Tick(now) end
+  if PC.Scout then PC.Scout:Tick(now) end
+  if PC.Attack then PC.Attack:Tick(now) end
 end
 
 -- Display helpers ---------------------------------------------------------------
@@ -1349,18 +1760,33 @@ function Capture:Remaining(view)
   if not view then return nil end
   if view.mode == "P" then
     local side = view.dir
+    local rate = Rate(view)
     if view.challenger == "-" then
       if side == view.owner then return nil end
-      return 1000 / FULL_RATE
+      return 1000 / rate
     end
-    if view.challenger == side then return (1000 - view.progress) / FULL_RATE end
-    local back = view.progress / FULL_RATE
-    if view.owner == "N" then back = back + 1000 / FULL_RATE end
+    if view.challenger == side then return (1000 - view.progress) / rate end
+    local back = view.progress / rate
+    if view.owner == "N" and not view.siege then back = back + 1000 / rate end
     return back
   elseif view.mode == "D" then
-    return view.progress / HALF_RATE
+    return view.progress / HalfRate(view)
   end
   return nil
+end
+
+-- A Settlement attempt held by one attacker with no defender (decision 0053).
+local function Frozen(view)
+  if not view.siege or view.mode ~= "C" or view.challenger == "-" then return false end
+  local attackers = view.challenger == "H" and view.nH or view.nA
+  local defenders = view.challenger == "H" and view.nA or view.nH
+  return attackers == 1 and defenders == 0
+end
+
+local function Clock(seconds)
+  seconds = Floor(seconds)
+  local minutes = math.floor(seconds / 60)
+  return string.format("%d:%02d", minutes, seconds - minutes * 60)
 end
 
 function Capture:ModeText(view)
@@ -1372,6 +1798,7 @@ function Capture:ModeText(view)
     end
     return "Capturing - " .. FACTION_NAMES[view.dir]
   elseif view.mode == "C" then
+    if Frozen(view) then return "Frozen - " .. FACTION_NAMES[view.challenger] .. " needs a second attacker" end
     return "Contested (" .. view.nH .. " vs " .. view.nA .. ")"
   elseif view.mode == "D" then
     if view.owner == "N" then return "Returning to neutral" end
@@ -1381,11 +1808,36 @@ function Capture:ModeText(view)
   return "Controlled by " .. owner
 end
 
+-- Why an attempt takes its time, or why a Settlement attempt cannot open for
+-- faction side (roadmap WP10): one line for the HUD and the map tooltip.
+function Capture:Detail(id, view, side, now)
+  local area = self:Outpost(id)
+  if not area or not view then return nil end
+  if area.type == "SETTLEMENT" then
+    if view.challenger ~= "-" then
+      return "Siege: " .. Clock(view.dur or SETTLEMENT_DURATION) .. " for a full bar, 2 attackers needed to advance"
+    end
+    if not FACTION_KEYS[side or ""] or side == view.owner then return nil end
+    local blocked = self:SiegeBlocked(id, side, now or Now())
+    if blocked then return "Siege locked: " .. blocked end
+    return "Siege open: " .. SIEGE_ATTACKERS .. " " .. FACTION_NAMES[side] .. " attackers inside start it"
+  end
+  if view.challenger ~= "-" then
+    return "Capture time " .. Clock(view.dur or CAPTURE_DURATION) .. ", set by the garrison when the attempt began"
+  end
+  if not FACTION_KEYS[view.owner] then return "Capture time " .. Clock(CAPTURE_DURATION) .. " (no garrison)" end
+  local defense, units = self:GarrisonDefense(id)
+  local dur = self:AttemptDuration(id)
+  if units == 0 then return "Capture time " .. Clock(dur) .. " (empty garrison)" end
+  return "Capture time " .. Clock(dur) .. " (garrison defense " .. defense .. ")"
+end
+
 -- Capture details for the map tooltip, nil when the area cannot be captured:
 -- owner, challenger and percent, status and seconds left, players inside, here.
 function Capture:TooltipInfo(id, now)
   if not self:Capturable(id) then return nil end
   local info = { owner = self:GetOwner(id) }
+  info.hint = self:BestHint(id, now or Now())
   if PC.Hunting and PC.Hunting:Area(id) then
     PC.Hunting:TooltipInfo(id, info)
     return info
@@ -1406,6 +1858,8 @@ function Capture:TooltipInfo(id, now)
     end
     info.nH, info.nA = view.nH, view.nA
   end
+  info.detail = self:Detail(id, view or { owner = info.owner, challenger = "-", progress = 0 },
+    self:MyFaction(), now)
   info.here = self.here ~= nil and self.here.id == id
   return info
 end
@@ -1429,6 +1883,7 @@ function Capture:GetHud(now)
     status = here.status,
     reason = here.reason,
     remaining = self:Remaining(view),
+    detail = self:Detail(here.id, view, self:MyFaction(), now),
   }
 end
 
@@ -1466,6 +1921,7 @@ function Capture:PrintStatus()
     .. " rejected=" .. self.rejected .. (self.lastReject and (" lastReject=" .. self.lastReject) or "")
     .. " duplicateCaptures=" .. self.duplicates)
   if PC.SendQueue then Print("capture: " .. PC.SendQueue:Summary()) end
+  if PC.Catchup then Print("capture: " .. PC.Catchup:Summary()) end
   -- Live receive counters: SavedVariables diagnostics can lag or be stale.
   local p2p = PC.P2PTest or {}
   Print("capture: channelEvents=" .. (p2p.channelEvents or 0) .. " routed=" .. (p2p.capRouted or 0)
