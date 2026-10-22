@@ -16,7 +16,9 @@ PC.Import = Import
 -- capture state and is never sent on the channel (C11, rule R16).
 -- Schema 2 adds the cloud owners of the character's realm (decision 0060);
 -- schema 1 (no owners) is still accepted.
-local SCHEMA = 2
+-- Schema 3 adds the membership ticket, the revocation list and the faction
+-- history (decision 0061, roadmap WP15).
+local SCHEMA = 3
 local U32 = 4294967296
 local I31 = 2147483648
 local CRC_POLY = 3988292384 -- 0xEDB88320
@@ -102,7 +104,35 @@ do
     },
   }
 end
-local SPECS = { [1] = SPEC, [2] = SPEC2 }
+-- Schema 3: schema 2 plus ticketEpoch, tickets = { [char] = { k, f, a, b, s } }
+-- (this character's ticket only, 0 or 1), revoked = { [char] = day } and
+-- history = { { d, h, a }, ... } (decision 0061).
+local MAX_DAY = 1000000
+local SPEC3 = { kind = "record", fields = {} }
+do
+  local key, field
+  for key, field in pairs(SPEC2.fields) do SPEC3.fields[key] = field end
+  SPEC3.fields.ticketEpoch = Int(MAX_DAY)
+  SPEC3.fields.tickets = {
+    kind = "map", key = CHAR, max = 1,
+    value = {
+      kind = "record",
+      fields = {
+        k = Id(1, "^[0-9a-z]$"),
+        f = Id(1, "^[HA]$"),
+        a = Int(MAX_DAY),
+        b = Int(MAX_DAY),
+        s = Id(86, "^[%w%-_]+$"),
+      },
+    },
+  }
+  SPEC3.fields.revoked = { kind = "map", key = CHAR, max = 256, value = Int(MAX_DAY) }
+  SPEC3.fields.history = {
+    kind = "list", max = 7,
+    value = { kind = "record", fields = { d = Int(MAX_DAY), h = Int(MAX_OWNERS), a = Int(MAX_OWNERS) } },
+  }
+end
+local SPECS = { [1] = SPEC, [2] = SPEC2, [3] = SPEC3 }
 
 local function ValidChar(text)
   if type(text) ~= "string" or string.len(text) > MAX_CHAR or string.find(text, "%c") then return false end
@@ -338,6 +368,15 @@ function Import:Validate(raw)
       end
     end
   end
+  if raw.tickets then
+    local who, t
+    for who, t in pairs(raw.tickets) do
+      -- Only this character's ticket, a 7-day window, a full signature.
+      if who ~= raw.char or t.a > t.b or t.b - t.a > 6 or string.len(t.s) ~= 86 then
+        return nil, "invalid import.tickets"
+      end
+    end
+  end
   if raw.pc ~= PC.channelLevel then return nil, "level" end
   local me = Me()
   if not me or raw.char ~= me then return nil, "other character" end
@@ -387,6 +426,23 @@ local function MergeInto(into, data)
       end
     end
   end
+  -- Tickets (decision 0061): the newest epoch, the ticket that lasts longer; the
+  -- revocation list and the history of the later Worker reading.
+  if data.ticketEpoch and (not into.ticketEpoch or data.ticketEpoch > into.ticketEpoch) then
+    into.ticketEpoch = data.ticketEpoch
+  end
+  if data.tickets then
+    if not into.tickets then into.tickets = {} end
+    local who, t
+    for who, t in pairs(data.tickets) do
+      local old = into.tickets[who]
+      if not old or t.b > old.b or (t.b == old.b and t.a > old.a) then into.tickets[who] = Copy(t) end
+    end
+  end
+  if data.revoked and (not into.revoked or data.generatedAt >= into.generatedAt) then
+    into.revoked = Copy(data.revoked)
+    into.history = Copy(data.history)
+  end
   into.leaderboard = Copy(data.leaderboard)
   into.importId, into.generatedAt, into.catalogVersion = data.importId, data.generatedAt, data.catalogVersion
   return into
@@ -401,6 +457,11 @@ local function Rebuild(self)
   end
   -- Cloud owners: shown and used as a generation floor only (decision 0060).
   if PC.Capture and PC.Capture.SetCloud then PC.Capture:SetCloud(self.data and self.data.owners) end
+  -- Membership ticket and revocation list (modules/ticket.lua, decision 0061).
+  if PC.Ticket and self.data then
+    local ok, err = pcall(PC.Ticket.OnImport, PC.Ticket, self.data)
+    if not ok and PC.RecordError then PC.RecordError("ticket import", err) end
+  end
 end
 
 local function SaveState(self, importId)

@@ -42,6 +42,7 @@ local CHANNEL_TYPE_BY_ID = { HI = "HELLO", D = "DATA", V = "VERSION" }
 local CAPTURE_IDS = {
   P = true, S = true, Q = true, K = true, H = true, HQ = true, OD = true, OL = true, X = true,
   G = true, GD = true, GQ = true, SC = true, SQ = true, SL = true, AC = true, AQ = true, AL = true, AR = true,
+  T = true, TQ = true,
 }
 local CUSTOM_CHANNEL_MAX_BYTES = 255
 local CUSTOM_CHANNEL_TRANSPORT = "CHANNEL_CHAT"
@@ -781,6 +782,11 @@ local function CompleteAutoJoinCycle(status, channel, errorText)
       if PC.Version then
         local announced, announceError = pcall(PC.Version.Announce, PC.Version)
         if not announced then PC.RecordError("version announce", announceError) end
+      end
+      -- Membership ticket, once per join (modules/ticket.lua, decision 0061).
+      if PC.Ticket then
+        local joined, joinError = pcall(PC.Ticket.OnJoined, PC.Ticket)
+        if not joined then PC.RecordError("ticket join", joinError) end
       end
       -- Owner catch-up digest, 10 s later (modules/catchup.lua, decision 0038).
       if PC.Catchup then
@@ -1857,6 +1863,14 @@ local function SlashCommand(message)
       return
     end
     PC.Companion:PrintStatus()
+    return
+  end
+  if string.lower(scope or "") == "ticket" then
+    if not PC.Ticket then
+      PC.Print("membership tickets are unavailable (restart the client after an update)")
+      return
+    end
+    PC.Ticket:Command(rest)
     return
   end
   if string.lower(scope or "") == "fileprobe" then

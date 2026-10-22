@@ -89,6 +89,8 @@ local QUOTA_TOTAL = 48
 local QUOTA_BY_KIND = {
   S = 40, P = 20, Q = 6, HQ = 6, H = 10, K = 20, OD = 4, OL = 12, X = 20, G = 20, GD = 6, GQ = 6,
   SC = 6, SQ = 6, SL = 20, AC = 6, AQ = 6, AL = 20, AR = 10,
+  -- T, TQ: membership ticket and its request (modules/ticket.lua, decision 0061).
+  T = 6, TQ = 6,
 }
 -- Owner claims nobody here saw happen (decision 0038): relayed S and H, OL
 -- catch-up lines, K beyond the next capture. They are hints, never confirmed
@@ -1863,6 +1865,16 @@ function Capture:OnMessage(kind, data, senderName, isEcho)
   if not self:AllowSender(sender, kind, now) then return self:Reject("quota " .. kind, sender) end
 
   local parts = Split(data, ",")
+  -- Membership tickets (decision 0061): T and TQ before any routing. Step 4b
+  -- drops a revoked character's messages as if they were lost; in the OBSERVE
+  -- mode nothing else is ever dropped for a missing ticket.
+  if kind == "T" or kind == "TQ" then
+    if not PC.Ticket then return self:Reject("tickets unavailable", sender) end
+    local handled, err = PC.Ticket:OnMessage(kind, parts, sender, now)
+    if not handled then return self:Reject(err or ("bad " .. kind), sender) end
+    return true
+  end
+  if PC.Ticket and not PC.Ticket:Admit(sender, kind, now) then return self:Ignore("revoked character", senderName) end
   local id = parts[1]
   if kind == "K" or kind == "H" or kind == "HQ" then
     if not PC.Hunting then return self:Reject("hunting unavailable", sender) end
@@ -1900,6 +1912,8 @@ function Capture:OnMessage(kind, data, senderName, isEcho)
     if parts[4] == "W" and self:Outpost(id).type ~= "SETTLEMENT" then
       return self:Reject("bad P", sender)
     end
+    -- Counted only (OBSERVE mode): a verified member stating the other faction.
+    if PC.Ticket then PC.Ticket:NoteFaction(sender, parts[2]) end
     return self:OnPresenceMessage(sender, id, parts[2], status, now, parts[4])
   elseif kind == "Q" then
     if table.getn(parts) ~= 1 then return self:Reject("bad Q", sender) end

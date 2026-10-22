@@ -12,6 +12,7 @@ core\send_queue.lua
 core\version.lua
 data\pois.lua
 data\ui_atlas.lua
+data\ticket_keys.lua
 modules\ui_skin.lua
 modules\area_contours.lua
 modules\map.lua
@@ -21,6 +22,8 @@ modules\witness.lua
 modules\progress.lua
 modules\import.lua
 modules\companion.lua
+modules\ed25519.lua
+modules\ticket.lua
 modules\capture.lua
 modules\hunting.lua
 modules\catchup.lua
