@@ -11,27 +11,27 @@ local Garrison = {
 PC.Garrison = Garrison
 
 -- Collective garrisons of Outposts and Settlements, and the Settlement upgrade
--- funds (roadmap WP7, docs/garrison.md, decision 0049). A garrison is three
--- unit counters plus, for a Settlement, a gold and a wood fund, all bound to
+-- War Chests (roadmap WP7, docs/garrison.md, decision 0049). A garrison is three
+-- unit counters plus, for a Settlement, a War Chest of gold and wood, all bound to
 -- the POI's ownership generation: a capture wipes them. One keeper per POI, a
--- present player of the owning faction, applies the donations in order and
--- announces the state G; a donor sends GD and waits for the keeper's answer.
+-- present player of the owning faction, applies the pledges in order and
+-- announces the state G; a pledger sends GD and waits for the keeper's answer.
 -- Values from the V1 balance sheet (decision 0047, tools/balance_sim.py).
 local OUTPOST_CAPACITY = 12
 local SETTLEMENT_CAPACITY = { 28, 40, 50 }
--- Cumulative fund reaching levels 2 and 3 (1,200 + 300, then 2,400 + 600 more).
+-- Cumulative War Chest reaching levels 2 and 3 (1,200 + 300, then 2,400 + 600 more).
 local LEVEL_GOLD = { 0, 1200, 3600 }
 local LEVEL_WOOD = { 0, 300, 900 }
 local UNIT_FIELDS = { FOOTMAN = "f", RIFLEMAN = "r", MORTAR = "m" }
 local UNIT_ORDER = { "FOOTMAN", "RIFLEMAN", "MORTAR" }
-local FUND_KINDS = { gold = true, wood = true }
+local CHEST_KINDS = { gold = true, wood = true }
 local MAX_UNITS = 50
 local MAX_NUMBER = 1000000
 local MAX_OP = 1000000000
 -- Post-combat lock bound (decision 0047), carried in G and AR (decision 0052).
 local LOCK_MAX = 1200
 -- Same election delays as an outpost's timer; the keeper waits for the
--- answers to its takeover before it accepts donations (READY_DELAY).
+-- answers to its takeover before it accepts pledges (READY_DELAY).
 local ENTRY_GRACE = 3.5
 local READY_DELAY = 4
 local MIN_BROADCAST_GAP = 1
@@ -46,17 +46,17 @@ local REPLY_ANY = 4
 local SAVE_INTERVAL = 5
 local SCHEMA = 1
 local MAX_LEVELS = 3
--- Four base-36 characters naming a donor in the keeper's answer.
+-- Four base-36 characters naming a pledger in the keeper's answer.
 local TAG_MODULUS = 1679609
 local DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 local RESULTS = {
   A = "accepted",
   F = "the garrison is full",
-  X = "the upgrade fund is full",
+  X = "the War Chest is full",
   C = "an enemy capture is in progress",
   O = "the keeper does not see you inside, or this place is not held by your faction",
   G = "this place changed hands",
-  B = "invalid donation",
+  B = "invalid pledge",
   L = "reinforcements are blocked by an attack (final approach, battle or post-combat lock)",
 }
 local PLACE_NAMES = { OUTPOST = "Outpost", SETTLEMENT = "Settlement" }
@@ -124,7 +124,7 @@ local function Base36(value, width)
   return text
 end
 
--- Names the donor inside the keeper's answer. Only the donor compares it with
+-- Names the pledger inside the keeper's answer. Only the pledger compares it with
 -- its own name; nobody reads an identity from it (rule R1).
 function Garrison.Tag(identity)
   local h = 0
@@ -170,7 +170,7 @@ local function Defense(st)
 end
 
 -- The garrison of a POI at its current ownership generation. A newer
--- generation (a capture) starts empty, at level 1, with an empty fund.
+-- generation (a capture) starts empty, at level 1, with an empty War Chest.
 function Garrison:GetState(id)
   local owner, generation = PC.Capture:GetOwner(id)
   local st = self.states[id]
@@ -194,7 +194,7 @@ end
 
 local CONTENT = { "f", "r", "m", "gold", "wood" }
 
--- Total order of two states of one generation (rule R5): more donations
+-- Total order of two states of one generation (rule R5): more pledges
 -- applied, then the later keeper epoch, then the larger content. Within a
 -- generation a garrison only grows in V1, so the larger state is the newer.
 local function Beats(a, b)
@@ -249,7 +249,7 @@ function Garrison:KeeperAlive(st, now)
 end
 
 -- An enemy capture attempt under way on this POI, from the moment it opens:
--- no donation for its whole duration, frozen or not (decision 0053).
+-- no pledge for its whole duration, frozen or not (decision 0053).
 function Garrison:Contested(id, owner, now)
   local view = PC.Capture:GetView(id, now)
   return view ~= nil and view.challenger ~= "-" and view.challenger ~= owner
@@ -271,8 +271,8 @@ function Garrison:LockLeft(st, now)
 end
 
 -- G <poi>,<gen>,<ver>,<epoch>,<f>,<r>,<m>,<gold>,<wood>,<lock>,<op>,<tag>,<result>,<relay>
--- relay 0: the keeper's own state, answering donation op of the tagged donor;
--- relay 1: an answer to GQ, without any answer to a donation. lock: seconds
+-- relay 0: the keeper's own state, answering pledge op of the tagged pledger;
+-- relay 1: an answer to GQ, without any answer to a pledge. lock: seconds
 -- left of the post-combat lock (decision 0052).
 function Garrison:SendState(st, relay)
   local op, tag, result = 0, "0000", "-"
@@ -309,7 +309,7 @@ function Garrison:TakeOver(st, now)
   st.relayable = true
   st.ack = nil
   -- Peers that know a later garrison answer this first state (OnStateMessage);
-  -- donations wait until they had the time to.
+  -- pledges wait until they had the time to.
   st.readyAt = now + READY_DELAY
   st.repeatAt = now + REPEAT_AFTER
   Record("GARRISON_KEEPER", { id = st.id, epoch = st.top, ver = st.ver })
@@ -326,14 +326,14 @@ local function Remember(st, key, result)
   st.applied[key] = result
 end
 
--- The keeper's decision on one donation, before anything changes.
-function Garrison:Judge(st, donor, f, now)
+-- The keeper's decision on one pledge, before anything changes.
+function Garrison:Judge(st, pledger, f, now)
   local area = self:Area(st.id)
   if f.gen ~= st.gen then return "G" end
-  if PresentFaction(st.id, donor, now) ~= st.owner then return "O" end
+  if PresentFaction(st.id, pledger, now) ~= st.owner then return "O" end
   if self:Contested(st.id, st.owner, now) then return "C" end
   if f.f + f.r + f.m + f.gold + f.wood <= 0 then return "B" end
-  -- Units only: the upgrade fund ignores armies and battles (decision 0052).
+  -- Units only: the War Chest ignores armies and battles (decision 0052).
   if f.f + f.r + f.m > 0 and PC.Attack and PC.Attack:Freeze(st.id, now) then return "L" end
   if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return "B" end
   local gold, wood = st.gold + f.gold, st.wood + f.wood
@@ -342,13 +342,13 @@ function Garrison:Judge(st, donor, f, now)
   return "A"
 end
 
--- Applies a donation once per (donor, op) and answers it in the next state; a
+-- Applies a pledge once per (pledger, op) and answers it in the next state; a
 -- repeated request gets the same answer again (rule R8).
-function Garrison:Apply(st, donor, f, now)
-  local key = donor .. ":" .. f.op
+function Garrison:Apply(st, pledger, f, now)
+  local key = pledger .. ":" .. f.op
   local result = st.applied[key]
   if not result then
-    result = self:Judge(st, donor, f, now)
+    result = self:Judge(st, pledger, f, now)
     if result == "A" then
       local before = Garrison.Level(st.gold, st.wood)
       st.f, st.r, st.m = st.f + f.f, st.r + f.r, st.m + f.m
@@ -361,9 +361,9 @@ function Garrison:Apply(st, donor, f, now)
       if after > before then Record("GARRISON_LEVEL", { id = st.id, level = after }) end
     end
     Remember(st, key, result)
-    Record("GARRISON_APPLIED", { id = st.id, donor = donor, op = f.op, result = result, ver = st.ver })
+    Record("GARRISON_APPLIED", { id = st.id, pledger = pledger, op = f.op, result = result, ver = st.ver })
   end
-  st.ack = { op = f.op, tag = Garrison.Tag(donor), result = result }
+  st.ack = { op = f.op, tag = Garrison.Tag(pledger), result = result }
   st.sendDue = true
   if now - st.lastBroadcastAt >= MIN_BROADCAST_GAP then self:Broadcast(st, now) end
   return result
@@ -481,7 +481,7 @@ function Garrison:ParseState(parts, area)
     or (parts[14] ~= "0" and parts[14] ~= "1") then
     return nil, "bad G code"
   end
-  if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return nil, "fund outside a Settlement" end
+  if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return nil, "War Chest outside a Settlement" end
   if Size(f.f, f.r, f.m) > self:Capacity(area, f.gold, f.wood) then return nil, "garrison above capacity" end
   f.relay = parts[14] == "1"
   return f
@@ -503,7 +503,7 @@ function Garrison:ParseRequest(parts, area)
     return nil, "bad GD number"
   end
   if f.op < 1 or f.f + f.r + f.m + f.gold + f.wood <= 0 then return nil, "empty GD" end
-  if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return nil, "fund outside a Settlement" end
+  if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return nil, "War Chest outside a Settlement" end
   return f
 end
 
@@ -618,7 +618,7 @@ end
 function Garrison:OnRequest(sender, f, now)
   local st = self:GetState(f.id)
   local me = Me()
-  -- Only the keeper answers; before it is ready the donor simply asks again.
+  -- Only the keeper answers; before it is ready the pledger simply asks again.
   if not me or st.authority ~= me or now < st.readyAt then return true end
   self:Apply(st, sender, f, now)
   return true
@@ -644,22 +644,22 @@ function Garrison:OnMessage(kind, parts, sender, now)
   return self:Reject("unknown kind", sender)
 end
 
--- Local donor ---------------------------------------------------------------
+-- Local pledger ---------------------------------------------------------------
 
 local function UnitKey(text)
   if type(text) ~= "string" then return nil end
   local lower = string.lower(text)
-  if FUND_KINDS[lower] then return lower end
+  if CHEST_KINDS[lower] then return lower end
   return PC.Army and PC.Army:Key(text)
 end
 
 function Garrison:Name(kind, owner)
-  if FUND_KINDS[kind] then return kind end
+  if CHEST_KINDS[kind] then return kind end
   local faction = (owner == "H" or owner == "A") and owner or nil
   return PC.Army:Name(kind, faction)
 end
 
--- Why the local player cannot donate here right now, or nil. Amounts are
+-- Why the local player cannot pledge here right now, or nil. Amounts are
 -- checked by Check.
 function Garrison:Closed(area, now)
   if not area then return "go inside an Outpost or Settlement of your faction" end
@@ -683,22 +683,22 @@ function Garrison:Closed(area, now)
     return "you are not counted inside: " .. tostring(here and here.reason or "presence unknown")
   end
   if self:Contested(area.id, st.owner, now) then return "an enemy capture is in progress" end
-  if self:Pending() then return "your previous donation is still waiting for an answer" end
+  if self:Pending() then return "your previous pledge is still waiting for an answer" end
   local me = Me()
   if not self:KeeperAlive(st, now) then return "no garrison keeper yet: wait a few seconds" end
   if st.authority == me and now < st.readyAt then return "the garrison keeper just changed: wait a few seconds" end
   return nil
 end
 
--- Checks a donation without changing anything. kind is a unit key, "gold" or
+-- Checks a pledge without changing anything. kind is a unit key, "gold" or
 -- "wood". Returns st, reserve, wallet or nil, reason.
 function Garrison:Check(kind, count, now)
   now = now or Now()
-  if not UNIT_FIELDS[kind] and not FUND_KINDS[kind] then
+  if not UNIT_FIELDS[kind] and not CHEST_KINDS[kind] then
     if kind == "SCOUT" then return nil, "scouts cannot join a garrison" end
     return nil, "unknown unit or resource"
   end
-  local most = FUND_KINDS[kind] and LEVEL_GOLD[3] or MAX_UNITS
+  local most = CHEST_KINDS[kind] and LEVEL_GOLD[3] or MAX_UNITS
   if type(count) ~= "number" or count < 1 or count > most or math.floor(count) ~= count then
     return nil, "count must be 1 to " .. most
   end
@@ -709,12 +709,12 @@ function Garrison:Check(kind, count, now)
   local closed = self:Closed(area, now)
   if closed then return nil, closed end
   local st = self:GetState(area.id)
-  if FUND_KINDS[kind] then
-    if area.type ~= "SETTLEMENT" then return nil, "only Settlements have an upgrade fund" end
+  if CHEST_KINDS[kind] then
+    if area.type ~= "SETTLEMENT" then return nil, "only Settlements have a War Chest" end
     if wallet[kind] < count then return nil, "not enough " .. kind .. ": you have " .. wallet[kind] end
     local cap = kind == "gold" and LEVEL_GOLD[3] or LEVEL_WOOD[3]
     if st[kind] + count > cap then
-      return nil, "the " .. kind .. " fund needs only " .. (cap - st[kind]) .. " more"
+      return nil, "the War Chest needs only " .. (cap - st[kind]) .. " more " .. kind
     end
     return st, reserve, wallet
   end
@@ -742,12 +742,12 @@ function Garrison:Pending()
 end
 
 local function Take(reserve, wallet, kind, count)
-  if FUND_KINDS[kind] then wallet[kind] = wallet[kind] - count else reserve[kind] = reserve[kind] - count end
+  if CHEST_KINDS[kind] then wallet[kind] = wallet[kind] - count else reserve[kind] = reserve[kind] - count end
 end
 
 function Garrison:Finish(p, ok, text)
   self.last = { ok = ok, text = text, at = Now() }
-  Record(ok and "GARRISON_DONATED" or "GARRISON_REFUNDED",
+  Record(ok and "GARRISON_PLEDGED" or "GARRISON_REFUNDED",
     { id = p.id, kind = p.kind, count = p.count, op = p.op, reason = text })
   Print(text)
 end
@@ -757,19 +757,19 @@ end
 function Garrison:Refund(p, reserve, reason)
   reserve.pending = nil
   local name = self:Name(p.kind, p.owner)
-  if FUND_KINDS[p.kind] then
+  if CHEST_KINDS[p.kind] then
     if PC.Economy then PC.Economy:Add(p.kind, p.count) end
   else
     reserve[p.kind] = reserve[p.kind] + p.count
   end
-  self:Finish(p, false, "Donation of " .. p.count .. " " .. name .. " returned: " .. reason)
+  self:Finish(p, false, "Pledge of " .. p.count .. " " .. name .. " returned: " .. reason)
 end
 
--- Donates count units (or gold/wood) to the garrison or fund of the POI the
--- player stands in. op is the reserve's donation number read by the caller: a
--- repeated or stale request is refused, so one confirmed action donates once.
+-- Pledges count units (or gold/wood) to the garrison or War Chest of the POI the
+-- player stands in. op is the reserve's pledge number read by the caller: a
+-- repeated or stale request is refused, so one confirmed action pledges once.
 -- The units leave at once; the keeper's refusal or silence gives them back.
-function Garrison:Donate(kind, count, op)
+function Garrison:Pledge(kind, count, op)
   local now = Now()
   local st, reserve, wallet = self:Check(kind, count, now)
   if not st then return false, reserve end
@@ -789,8 +789,8 @@ function Garrison:Donate(kind, count, op)
       self:Refund(p, reserve, RESULTS[result])
       return false, RESULTS[result]
     end
-    self:Finish(p, true, "Donated " .. count .. " " .. self:Name(kind, st.owner) .. " to " .. st.id)
-    return true, "donated"
+    self:Finish(p, true, "Pledged " .. count .. " " .. self:Name(kind, st.owner) .. " to " .. st.id)
+    return true, "pledged"
   end
   reserve.pending = p
   self.pendingThisSession = true
@@ -798,7 +798,7 @@ function Garrison:Donate(kind, count, op)
   return true, "sent"
 end
 
--- The keeper's answer to our pending donation, in a direct state.
+-- The keeper's answer to our pending pledge, in a direct state.
 function Garrison:SeeAnswer(st, sender, f)
   local p, reserve = self:Pending()
   if not p or p.id ~= f.id or p.to ~= sender or f.op ~= p.op or f.result == "-" then return end
@@ -806,13 +806,13 @@ function Garrison:SeeAnswer(st, sender, f)
   if not me or f.tag ~= Garrison.Tag(me) then return end
   if f.result == "A" then
     reserve.pending = nil
-    self:Finish(p, true, "Donated " .. p.count .. " " .. self:Name(p.kind, p.owner) .. " to " .. p.id)
+    self:Finish(p, true, "Pledged " .. p.count .. " " .. self:Name(p.kind, p.owner) .. " to " .. p.id)
   else
     self:Refund(p, reserve, RESULTS[f.result])
   end
 end
 
--- Retries a pending donation to the same keeper only: asking a new keeper
+-- Retries a pending pledge to the same keeper only: asking a new keeper
 -- could apply it twice (risk B30). Gives up and refunds otherwise.
 function Garrison:TickPending(now)
   local p, reserve = self:Pending()
@@ -833,8 +833,8 @@ function Garrison:TickPending(now)
   end
 end
 
--- /pc donate <unit|gold|wood> <count> confirm
-function Garrison:DonateCommand(text)
+-- /pc pledge <unit|gold|wood> <count> confirm
+function Garrison:PledgeCommand(text)
   local words = {}
   local position = 1
   while true do
@@ -849,23 +849,23 @@ function Garrison:DonateCommand(text)
   if count then table.remove(words) else count = 1 end
   local kind = UnitKey(table.concat(words, " "))
   if not kind then
-    Print("usage: /pc donate <footman|rifleman|mortar|gold|wood> [count] confirm")
+    Print("usage: /pc pledge <footman|rifleman|mortar|gold|wood> [count] confirm")
     return false
   end
   local st, reason = self:Check(kind, count)
   if not st then
-    Print("donation refused: " .. tostring(reason))
+    Print("pledge refused: " .. tostring(reason))
     return false
   end
   local name = self:Name(kind, st.owner)
   if not confirm then
-    Print("Irreversible: " .. count .. " " .. name .. " can never be taken back. Type /pc donate "
+    Print("Irreversible: " .. count .. " " .. name .. " can never be taken back. Type /pc pledge "
       .. string.lower(kind) .. " " .. count .. " confirm")
     return false
   end
-  local ok, result = self:Donate(kind, count, reason.gop)
-  if not ok then Print("donation refused: " .. tostring(result)) end
-  if ok and result == "sent" then Print("Donation of " .. count .. " " .. name .. " sent to the garrison keeper") end
+  local ok, result = self:Pledge(kind, count, reason.gop)
+  if not ok then Print("pledge refused: " .. tostring(result)) end
+  if ok and result == "sent" then Print("Pledge of " .. count .. " " .. name .. " sent to the garrison keeper") end
   return ok
 end
 
@@ -1021,7 +1021,7 @@ function Garrison:View(id, now)
   elseif st.ver > 0 then
     view.source = "reported by a player, unverified"
   else
-    view.source = "no donation seen"
+    view.source = "no pledge seen"
   end
   return view
 end
@@ -1042,17 +1042,17 @@ function Garrison:PrintStatus()
   end
   Print(text .. " - defense " .. view.defense .. " - " .. view.source)
   if view.settlement then
-    Print("level " .. view.level .. "/3, fund gold " .. view.gold .. " wood " .. view.wood
+    Print("level " .. view.level .. "/3, War Chest gold " .. view.gold .. " wood " .. view.wood
       .. (view.nextGold and (" (level " .. (view.level + 1) .. " at " .. view.nextGold .. " gold and "
         .. view.nextWood .. " wood)") or ""))
   end
   local now = Now()
   local closed = self:Closed(self:Area(view.id), now)
-  Print(closed and ("donations closed: " .. closed) or "donations open: /pc donate <unit|gold|wood> [count] confirm")
+  Print(closed and ("pledges closed: " .. closed) or "pledges open: /pc pledge <unit|gold|wood> [count] confirm")
   local frozen = not closed and PC.Attack and PC.Attack:Freeze(view.id, now)
   if frozen then Print("units cannot be given right now: " .. frozen) end
   local p = self:Pending()
-  if p then Print("waiting for the keeper to answer your donation of " .. p.count .. " " .. self:Name(p.kind, p.owner)) end
+  if p then Print("waiting for the keeper to answer your pledge of " .. p.count .. " " .. self:Name(p.kind, p.owner)) end
 end
 
 if PC.Presence and PC.Presence.OnChange then

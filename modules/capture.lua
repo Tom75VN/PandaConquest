@@ -10,6 +10,9 @@ local Capture = {
   alerts = {},
   captured = {},
   hints = {},
+  -- Cloud owners of the import (decision 0060): one entry per POI, apart from
+  -- the P2P hints, never persisted nor sent.
+  cloud = {},
   -- Sender faction for the hint quorum. Only the chat language may fill it,
   -- once risk B12 is measured on OctoWoW; empty until then (decision 0038).
   senderFactions = {},
@@ -50,6 +53,12 @@ local PRESENCE_REST_TTL = 75
 -- Alone at rest, nobody counts on it but distant observers (decision 0034).
 local PRESENCE_LONE_INTERVAL = 60
 local PRESENCE_LONE_TTL = 150
+-- A Settlement no faction can siege: no presence there moves a bar, W
+-- every 60 s once it stayed so for QUIET_SETTLE, so every client learned the
+-- owners that made it quiet before the first W (decision 0058).
+local PRESENCE_QUIET_INTERVAL = 60
+local PRESENCE_QUIET_TTL = 150
+local QUIET_SETTLE = 30
 -- A busy authority repeats its S every 30 s, and at once on a transition or a
 -- recount; no 5 % steps (decision 0041). Three intervals of silence, as before.
 local STATE_INTERVAL = 30
@@ -71,7 +80,7 @@ local MAX_PRESENCE_PER_POI = 40
 local QUOTA_WINDOW = 10
 local QUOTA_TOTAL = 48
 -- X: shared stock of a resource POI (modules/stock.lua, decision 0048).
--- G, GD, GQ: garrison state, donation request and query (modules/garrison.lua,
+-- G, GD, GQ: garrison state, pledge request and query (modules/garrison.lua,
 -- decision 0049).
 -- SC, SQ, SL: scouting order, catch-up request and relayed scout
 -- (modules/scout.lua, decision 0050).
@@ -87,6 +96,10 @@ local QUOTA_BY_KIND = {
 local HINT_SENDERS = 4
 local HINT_TTL = 900
 local HINT_JUMP = 10
+-- Generation floor (decision 0060): values this close to the wire bound (1,000,000)
+-- are ignored, so a forged generation can never make the next capture unrepresentable.
+local FLOOR_MAX = 990000
+local CLOUD_RANKS = { C = 1, Q = 2, W = 3, D = 4 }
 -- Rule R14 with two answers: a pending reply waits for two matching answers
 -- from distinct senders, or four of any kind, before it is dropped.
 local REPLY_MATCHES = 2
@@ -100,6 +113,7 @@ Capture.CAPTURE_DURATION = CAPTURE_DURATION
 Capture.DECAY_DURATION = DECAY_DURATION
 Capture.MAX_DURATION = MAX_DURATION
 Capture.SETTLEMENT_DURATION = SETTLEMENT_DURATION
+Capture.SIEGE_ATTACKERS = SIEGE_ATTACKERS
 
 local FACTION_KEYS = { H = "HORDE", A = "ALLIANCE" }
 local FACTION_CODES = { HORDE = "H", ALLIANCE = "A" }
@@ -113,10 +127,13 @@ local CODE_STATUSES = { I = "IN", N = "NC", O = "OUT" }
 local EVENT_CODES = { START = "S", CAPTURED = "C" }
 local CODE_EVENTS = { ["-"] = "-", S = "START", C = "CAPTURED" }
 -- Presence cadence: F every 10 s, R at rest every 30 s (decision 0033), L
--- alone at rest every 60 s (decision 0034). Lifetime = 2.5 intervals.
-local CADENCE_TTLS = { F = PRESENCE_TTL, R = PRESENCE_REST_TTL, L = PRESENCE_LONE_TTL }
-local CADENCE_INTERVALS = { F = PRESENCE_INTERVAL, R = PRESENCE_REST_INTERVAL, L = PRESENCE_LONE_INTERVAL }
-local CADENCE_RANKS = { F = 1, R = 2, L = 3 }
+-- alone at rest every 60 s (decision 0034), W in a quiet neutral Settlement
+-- every 60 s (decision 0058). Lifetime = 2.5 intervals.
+local CADENCE_TTLS = { F = PRESENCE_TTL, R = PRESENCE_REST_TTL, L = PRESENCE_LONE_TTL, W = PRESENCE_QUIET_TTL }
+local CADENCE_INTERVALS = {
+  F = PRESENCE_INTERVAL, R = PRESENCE_REST_INTERVAL, L = PRESENCE_LONE_INTERVAL, W = PRESENCE_QUIET_INTERVAL,
+}
+local CADENCE_RANKS = { F = 1, R = 2, L = 3, W = 3 }
 
 Capture.FACTION_NAMES = FACTION_NAMES
 
@@ -236,7 +253,7 @@ local function Advance(st, dt, allowCapture)
         end
         dt = dt - need
         st.owner = side
-        st.generation = st.generation + 1
+        st.generation = Capture:NextGeneration(st.id, st.generation)
         st.challenger = "-"
         st.progress = 0
         event = "CAPTURED"
@@ -408,30 +425,68 @@ function Capture:AttemptDuration(id)
   return Capture.DefenseDuration((self:GarrisonDefense(id)))
 end
 
--- Why faction side cannot open a Settlement attempt now, or nil (decision
--- 0053): every linked objective held by side, an empty garrison and, when
--- the other faction holds it, a valid discovery by side. The two attackers
--- are counted by SiegeMode. Checked only when an attempt opens.
-function Capture:SiegeBlocked(id, side, now)
-  local owner = self:GetOwner(id)
-  if owner == side then return "already held by the " .. FACTION_NAMES[side] end
+-- The Settlement prerequisites for faction side (decision 0053), in the order
+-- SiegeBlocked checks them: every linked objective held by side, an empty
+-- garrison and, when the other faction holds it, a valid discovery by side.
+-- Each item { ok, text, why }: why is the refusal when ok is false. The two
+-- attackers are counted by SiegeMode. A local reading only (gameplay UI).
+function Capture:SiegeChecklist(id, side, now)
+  local list = {}
   local links = self:LinkedObjectives(id)
+  local held, missing = 0, nil
   local index = 1
   while index <= table.getn(links) do
-    if self:GetOwner(links[index]) ~= side then
-      local area = PC.Map.areas[links[index]]
-      return (area.label or links[index]) .. " is not held by the " .. FACTION_NAMES[side]
+    if self:GetOwner(links[index]) == side then
+      held = held + 1
+    elseif not missing then
+      missing = links[index]
     end
     index = index + 1
   end
+  local why
+  if missing then
+    why = (PC.Map.areas[missing].label or missing) .. " is not held by the " .. FACTION_NAMES[side]
+  end
+  table.insert(list, { ok = not missing, why = why,
+    text = "Every Outpost and Hunting Grounds of the zone held (" .. held .. "/" .. table.getn(links) .. ")" })
   local _, units = self:GarrisonDefense(id)
-  if units > 0 then return "its garrison still has " .. units .. " defender(s)" end
-  if FACTION_KEYS[owner] then
-    if not PC.Scout or not PC.Scout:Discovery(id, side, now) then
-      return "not scouted by the " .. FACTION_NAMES[side]
-    end
+  table.insert(list, { ok = units == 0, text = "Garrison emptied",
+    why = units > 0 and ("its garrison still has " .. units .. " defender(s)") or nil })
+  if FACTION_KEYS[self:GetOwner(id)] then
+    local found = PC.Scout and PC.Scout:Discovery(id, side, now)
+    table.insert(list, { ok = found and true or false, text = "Scouted in the last hour",
+      why = not found and ("not scouted by the " .. FACTION_NAMES[side]) or nil })
+  end
+  return list
+end
+
+-- Why faction side cannot open a Settlement attempt now, or nil: the first
+-- failed item of SiegeChecklist. Checked only when an attempt opens.
+function Capture:SiegeBlocked(id, side, now)
+  local owner = self:GetOwner(id)
+  if owner == side then return "already held by the " .. FACTION_NAMES[side] end
+  local list = self:SiegeChecklist(id, side, now)
+  local index = 1
+  while index <= table.getn(list) do
+    if not list[index].ok then return list[index].why end
+    index = index + 1
   end
   return nil
+end
+
+-- A Settlement, neutral or held, with no attempt and that no faction can siege
+-- (decision 0058): no presence there can open or move a bar, so W is allowed
+-- and receivers keep its 150 s. SiegeBlocked refuses the owner's own faction,
+-- so only a possible siege by another faction ends it. A state not known yet
+-- counts as idle: distant receivers have none, and an attempt only opens once
+-- a siege is possible. A known state whose owner differs from the registry is
+-- not quiet: one of them is behind, the fast cadence stays until they agree.
+function Capture:SettlementQuiet(id, now)
+  local area = self:Outpost(id)
+  if not area or area.type ~= "SETTLEMENT" then return false end
+  local st = self.states[id]
+  if st and st.known and (st.owner ~= self:GetOwner(id) or not IsIdle(st)) then return false end
+  return self:SiegeBlocked(id, "H", now) ~= nil and self:SiegeBlocked(id, "A", now) ~= nil
 end
 
 -- Mode and direction of a Settlement's bar (decision 0053). With no attempt,
@@ -578,6 +633,17 @@ function Capture:LoadOwners()
   while index <= table.getn(stale) do
     pois[stale[index]] = nil
     index = index + 1
+  end
+  -- Presence is sampled before the first tick: after a /reload inside a POI its
+  -- state was created with the static owner. Unknown states follow the registry.
+  local st
+  for id, st in pairs(self.states) do
+    local owner, generation = self:GetOwner(id)
+    if not st.known and generation > st.generation then
+      st.owner, st.generation = owner, generation
+      st.challenger, st.progress = "-", 0
+      st.mode, st.dir = "R", "-"
+    end
   end
   self:RestoreProgress(bucket)
   if PC.Hunting then PC.Hunting:Restore(bucket) end
@@ -740,7 +806,23 @@ function Capture:Quorum(id, owner, generation)
   local _, currentGeneration = self:GetOwner(id)
   local extra = generation - currentGeneration > HINT_JUMP and 1 or 0
   if factions.H and factions.A and count >= 2 + extra then return true end
-  return count >= 3 + extra
+  if count >= 3 + extra then return true end
+  -- A witnessed cloud owner is one vote: one live sender other than its
+  -- capturer confirms it (decision 0060).
+  local cloud = self.cloud[id]
+  if cloud and cloud.t == "W" and cloud.o == owner and cloud.g == generation then
+    local others = 0
+    index = 1
+    while index <= table.getn(list) do
+      local claim = list[index]
+      if claim.owner == owner and claim.generation == generation and claim.sender ~= cloud.c then
+        others = others + 1
+      end
+      index = index + 1
+    end
+    return others >= 1 + extra
+  end
+  return false
 end
 
 -- A promoted hint enters the registry as PEER, without any effect (rule R4).
@@ -782,6 +864,72 @@ function Capture:BestHint(id, now)
   end
   if not bestOwner then return nil end
   return { owner = bestOwner, generation = bestGeneration, count = bestCount, age = Floor(now - bestAt) }
+end
+
+-- Cloud owners (decision 0060) --------------------------------------------------
+-- From the validated import only: { g, o (H/A, nil when disputed), t (C claimed,
+-- Q disputed claims, W witnessed, D disputed witnessed), c (capturer or nil) }.
+-- Shown, raising the generation floor, and one vote for a witnessed owner;
+-- never an owner for gameplay, never sent (rule R16 as amended).
+
+function Capture:SetCloud(owners, now)
+  self.cloud = {}
+  if type(owners) ~= "table" then return end
+  local id, e
+  for id, e in pairs(owners) do
+    if self:Capturable(id) and type(e) == "table" and CLOUD_RANKS[e.t] and type(e.g) == "number" and e.g >= 1 then
+      local owner = FACTION_KEYS[e.o] and e.o or nil
+      self.cloud[id] = { g = e.g, o = owner, t = e.t, c = owner and e.c or nil }
+    end
+  end
+  for id, e in pairs(self.cloud) do
+    if e.t == "W" and e.o then self:PromoteHint(id, e.o, e.g, now or Now()) end
+  end
+end
+
+-- The cloud entry worth showing: newer than the confirmed registry.
+function Capture:CloudHint(id)
+  local entry = self.cloud[id]
+  if not entry then return nil end
+  local _, generation = self:GetOwner(id)
+  if entry.g <= generation then return nil end
+  return entry
+end
+
+-- The largest generation known for id: registry, current state, cloud entry,
+-- and P2P hints at most HINT_JUMP above the registry. A capture is numbered one
+-- above it, so it wins over every capture its author did not see.
+function Capture:Floor(id, current)
+  local _, registry = self:GetOwner(id)
+  local best = registry
+  if type(current) == "number" and current > best then best = current end
+  local entry = self.cloud[id]
+  if entry and entry.g > best and entry.g <= FLOOR_MAX then best = entry.g end
+  local list = self.hints[id]
+  if list then
+    local index = 1
+    while index <= table.getn(list) do
+      local g = list[index].generation
+      if g > best and g <= registry + HINT_JUMP and g <= FLOOR_MAX then best = g end
+      index = index + 1
+    end
+  end
+  return best
+end
+
+-- Display of a cloud entry: label, owner code (nil when disputed), detail.
+function Capture.CloudLine(entry)
+  if entry.t == "W" then return "Unconfirmed", entry.o, "cloud, seen by 3+ players" end
+  if entry.t == "C" then
+    local name = string.gsub(entry.c or "?", "@.*$", "")
+    return "Claimed", entry.o, "by " .. name .. ", not verified"
+  end
+  return "Disputed", nil, "cloud reports disagree"
+end
+
+function Capture:NextGeneration(id, current)
+  if not id then return current + 1 end
+  return self:Floor(id, current) + 1
 end
 
 -- Rule R14 with two answers: `matches` says whether the answer seen carries the
@@ -890,9 +1038,14 @@ function Capture:SetPresence(id, identity, faction, status, now, ttl)
   -- lifetime from now, so a silent defender is not counted 50 s too long.
   -- A second player ends the lone one: nobody outlives the rest lifetime.
   -- Idempotent: repeating a presence never lengthens what this shortened.
+  -- A quiet Settlement caps nothing: no presence there can move a bar. Once a
+  -- siege is possible it caps as below, here every second on a present client,
+  -- on the next P elsewhere (decision 0058).
   local owner = self:GetOwner(id)
   local cap = nil
-  if self:HasRival(id, owner, now) then
+  if self:SettlementQuiet(id, now) then
+    cap = nil
+  elseif self:HasRival(id, owner, now) then
     cap = PRESENCE_TTL
   elseif self:LiveCount(id, now) > 1 then
     cap = PRESENCE_REST_TTL
@@ -1061,16 +1214,52 @@ end
 
 local function AlwaysTrue() return true end
 
--- An unknown level (no API, 0 while loading) does not block.
+-- False below level 5 (an unknown level, no API or 0 while loading, does not
+-- block) and, when the companion guard is loaded, without nampower or a running
+-- companion (decision 0059). Second result: why. Local only: it gates what this
+-- client sends, never how a message is accepted.
 function Capture:CanTalk()
   local ok, level = Call("UnitLevel", "player")
-  return not (ok and type(level) == "number" and level > 0 and level < MIN_CHANNEL_LEVEL)
+  if ok and type(level) == "number" and level > 0 and level < MIN_CHANNEL_LEVEL then
+    return false, self.LEVEL_REASON, "level"
+  end
+  local companion = PC.Companion
+  if companion and companion.Ready and not companion:Ready() then
+    return false, companion:Reason(), "companion"
+  end
+  return true
+end
+
+-- Why the player cannot take part right now, or nil.
+function Capture:LockReason()
+  local _, reason = self:CanTalk()
+  return reason
+end
+
+-- "level", "companion" or nil.
+function Capture:LockKind()
+  local _, _, kind = self:CanTalk()
+  return kind
+end
+
+-- True for a reason set by CanTalk (the HUD shows it as a hard block).
+function Capture:IsLockReason(reason)
+  if reason == nil then return false end
+  if reason == self.LEVEL_REASON then return true end
+  local companion = PC.Companion
+  return companion ~= nil and companion.IsReason ~= nil and companion:IsReason(reason)
 end
 
 function Capture:Eligibility()
   if Flag("UnitIsDeadOrGhost") then return "NC", "dead" end
   if Capture.afk then return "NC", "AFK" end
-  if not Flag("UnitIsPVP", AlwaysTrue) then return "NC", "not PvP flagged" end
+  if not Flag("UnitIsPVP", AlwaysTrue) then
+    -- The flag is gone: the next toggle can only turn PvP back on.
+    Capture.pvpOff = nil
+    return "NC", "not PvP flagged"
+  end
+  -- /pvp off keeps the flag about five minutes, UnitIsPVP included.
+  if Capture.pvpOff then return "NC", "PvP toggled off" end
   local mounted, source = MountedByDll()
   if mounted == nil then mounted, source = HasBuff(MOUNT_TEXTURES), "buff icons" end
   Capture.mountSource = source
@@ -1090,6 +1279,14 @@ local function AfkPrefix(name, fallback)
   return text
 end
 
+-- Server answers to /pvp; the client strings win over these fallbacks.
+local PVP_MESSAGES = {
+  ERR_PVP_TOGGLE_OFF = "PvP combat toggled off",
+  ERR_PVP_TOGGLE_ON = "PvP combat toggled on",
+  PVP_TOGGLE_OFF_VERBOSE = "You will be unflagged for PvP combat",
+  PVP_TOGGLE_ON_VERBOSE = "You are now flagged for PvP combat",
+}
+
 function Capture:OnSystemMessage(message)
   if type(message) ~= "string" then return end
   local marked = AfkPrefix("MARKED_AFK", "You are now AFK")
@@ -1099,6 +1296,43 @@ function Capture:OnSystemMessage(message)
   elseif marked ~= "" and string.find(message, marked, 1, true) == 1 then
     self.afk = true
   end
+  local name, text
+  for name, text in pairs(PVP_MESSAGES) do
+    local wanted = GetGlobal(name)
+    if type(wanted) ~= "string" then wanted = text end
+    if string.find(message, wanted, 1, true) == 1 then
+      self:SetPvpOff(string.find(name, "_OFF", 1, true) ~= nil)
+      return
+    end
+  end
+end
+
+-- 1.12 has no GetPVPDesired: the wanted state comes from the toggle itself.
+-- The server message, when it comes, overrides this guess.
+function Capture:OnPvpToggle()
+  if self.pvpOff then
+    self:SetPvpOff(false)
+  else
+    self:SetPvpOff(Flag("UnitIsPVP") and true or false)
+  end
+end
+
+-- The HUD and the presence follow on the next tick, not a second later.
+function Capture:SetPvpOff(off)
+  self.pvpOff = off or nil
+  self.lastEligibilityAt = nil
+  if PC.Stock then PC.Stock.lastEligibilityAt = nil end
+end
+
+-- /pvp calls the global at run time, so a wrapper sees every toggle.
+function Capture:HookPvpToggle()
+  local original = GetGlobal("TogglePVP")
+  if self.pvpHooked or type(original) ~= "function" then return end
+  self.pvpHooked = true
+  TogglePVP = function(a, b, c)
+    pcall(Capture.OnPvpToggle, Capture)
+    return original(a, b, c)
+  end
 end
 
 -- Transport -------------------------------------------------------------------
@@ -1107,9 +1341,10 @@ end
 -- key lets the send gate replace a queued message that this one supersedes;
 -- priority marks an event message, dropped last by a full send queue.
 function Capture:Send(kind, body, key, priority)
-  if not self:CanTalk() then
+  local talk, lockReason = self:CanTalk()
+  if not talk then
     self.sendFailures = self.sendFailures + 1
-    self.lastSendError = self.LEVEL_REASON
+    self.lastSendError = lockReason
     return false
   end
   local p2p = PC.P2PTest
@@ -1136,10 +1371,12 @@ end
 
 -- R only for a defender of an idle POI its faction owns, with no rival
 -- presence: nothing can start there until a rival's P arrives, which ends it.
--- L for the same defender when nobody else is live in the POI.
+-- L for the same defender when nobody else is live in the POI. W for anyone in
+-- a quiet Settlement (UpdateEligibility waits QUIET_SETTLE first).
 function Capture:PresenceCadence(id, faction, now)
   local st = self.states[id]
   if not st or not st.known or not IsIdle(st) then return "F" end
+  if self:SettlementQuiet(id, now) then return "W" end
   if st.owner ~= faction or self:GetOwner(id) ~= faction then return "F" end
   if self:HasRival(id, faction, now) then return "F" end
   if self:LiveCount(id, now) <= 1 then return "L" end
@@ -1255,6 +1492,8 @@ function Capture:AuthorityStep(id, now, force)
     self:HandleEvent(id, "START", dir, now)
   elseif event == "CAPTURED" then
     self:HandleEvent(id, "CAPTURED", st.owner, now, st.generation)
+    -- Our own capture: a claim for the cloud owner ledger (decision 0060).
+    if PC.Witness then PC.Witness:Note(self:Me(), "CAPTURED", id, st.generation, st.owner) end
   end
 end
 
@@ -1344,8 +1583,9 @@ function Capture:UpdateEligibility(now, force)
     return
   end
   -- No status: no presence, never a candidate for authority (Maintain).
-  if not self:CanTalk() then
-    here.status, here.reason = nil, self.LEVEL_REASON
+  local talk, lockReason = self:CanTalk()
+  if not talk then
+    here.status, here.reason = nil, lockReason
     return
   end
   local status, reason = self:Eligibility()
@@ -1354,6 +1594,14 @@ function Capture:UpdateEligibility(now, force)
   here.faction = faction
   self:SetPresence(here.id, me, faction, status, now)
   local cadence = self:PresenceCadence(here.id, faction, now)
+  -- W only after QUIET_SETTLE of quiet in a row: a receiver still behind on
+  -- the owner change that made it quiet would cap it to 25 s (decision 0058).
+  if cadence == "W" then
+    if not here.quietSince then here.quietSince = now end
+    if now - here.quietSince < QUIET_SETTLE then cadence = "F" end
+  else
+    here.quietSince = nil
+  end
   -- A faster cadence goes out at once: receivers then expect the next P
   -- sooner. A slower one waits for the P due under the previous cadence.
   local last = here.cadence or "F"
@@ -1465,7 +1713,9 @@ function Capture:CheckPlausible(st, f, now)
   local elapsed = math.max(0, now - st.lastStateAt)
   local reach = MAX_RATE * elapsed + PLAUSIBILITY_SLACK
   if f.owner ~= st.owner then
-    if f.generation ~= st.generation + 1 or st.challenger ~= f.owner
+    -- Any generation above ours: the authority numbers a capture above every
+    -- generation it knows, which may be more than ours (decision 0060).
+    if f.generation <= st.generation or st.challenger ~= f.owner
         or st.progress + reach < 1000 then
       return false, "implausible owner change"
     end
@@ -1548,7 +1798,7 @@ function Capture:OnStateMessage(sender, f, now)
   elseif f.event == "CAPTURED" then
     self:HandleEvent(id, "CAPTURED", f.owner, now, f.generation)
     -- The authority's own announce, accepted above; never a relayed answer.
-    if PC.Witness then PC.Witness:Note(sender, "CAPTURED", id, f.generation) end
+    if PC.Witness then PC.Witness:Note(sender, "CAPTURED", id, f.generation, f.owner) end
   end
   return true
 end
@@ -1646,6 +1896,10 @@ function Capture:OnMessage(kind, data, senderName, isEcho)
     if table.getn(parts) ~= 4 or not FACTION_KEYS[parts[2]] or not status or not CADENCE_TTLS[parts[4]] then
       return self:Reject("bad P", sender)
     end
+    -- W exists only in a Settlement (static type, the same for every client).
+    if parts[4] == "W" and self:Outpost(id).type ~= "SETTLEMENT" then
+      return self:Reject("bad P", sender)
+    end
     return self:OnPresenceMessage(sender, id, parts[2], status, now, parts[4])
   elseif kind == "Q" then
     if table.getn(parts) ~= 1 then return self:Reject("bad Q", sender) end
@@ -1713,7 +1967,11 @@ function Capture:UpdateMap(now)
     if self:Outpost(id) then
       local owner, half = self:GetDisplay(id, now)
       local hint = self:BestHint(id, now)
-      if hint then
+      local cloud = self:CloudHint(id)
+      if cloud and hint and hint.generation >= cloud.g then cloud = nil end
+      if cloud and cloud.o then
+        map:SetCaptureView(id, FACTION_KEYS[cloud.o], nil, true)
+      elseif hint then
         map:SetCaptureView(id, FACTION_KEYS[hint.owner], nil, true)
       else
         map:SetCaptureView(id, FACTION_KEYS[owner], half and FACTION_KEYS[half] or nil)
@@ -1838,6 +2096,9 @@ function Capture:TooltipInfo(id, now)
   if not self:Capturable(id) then return nil end
   local info = { owner = self:GetOwner(id) }
   info.hint = self:BestHint(id, now or Now())
+  info.cloud = self:CloudHint(id)
+  if info.cloud and info.hint and info.hint.generation >= info.cloud.g then info.cloud = nil end
+  if info.cloud and info.cloud.o and info.hint then info.hint = nil end
   if PC.Hunting and PC.Hunting:Area(id) then
     PC.Hunting:TooltipInfo(id, info)
     return info
@@ -1963,11 +2224,17 @@ if PC.RegisterEvent then
   PC.RegisterEvent("CHAT_MSG_SYSTEM", function(eventName, message)
     Capture:OnSystemMessage(message)
   end)
+  -- Where the server puts the /pvp answer is not measured yet.
+  PC.RegisterEvent("UI_INFO_MESSAGE", function(eventName, message)
+    Capture:OnSystemMessage(message)
+  end)
   -- Fires on logout, quit and /reload, before SavedVariables are written.
   PC.RegisterEvent("PLAYER_LOGOUT", function()
     Capture:SaveProgress(Now())
   end)
 end
+
+Capture:HookPvpToggle()
 
 local create = GetGlobal("CreateFrame")
 if type(create) == "function" then

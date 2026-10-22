@@ -358,7 +358,8 @@ function Scout:Check(targetId, now)
   if reserve.SCOUT < 1 then
     return nil, "no " .. army:Name("SCOUT") .. " in your reserve (/pc recruit scout)"
   end
-  if not PC.Capture:CanTalk() then return nil, PC.Capture.LEVEL_REASON or "you cannot speak on the channel yet" end
+  local talk, lockReason = PC.Capture:CanTalk()
+  if not talk then return nil, lockReason or "you cannot speak on the channel yet" end
   local mine = self:Mine(now)
   if mine then return nil, "your scout is still travelling (" .. Clock(Arrival(mine) - now) .. " left)" end
   local origin, why = army:Place()

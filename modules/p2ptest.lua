@@ -1676,6 +1676,7 @@ end
 
 local function PrintHelp()
   PC.Print("/pc or /pc ui (open or close the PandaConquest window); /pc help (this list)")
+  PC.Print("/pc classic (open or close the classic text window)")
   PC.Print("/pc map (world-map POI area renderer status)")
   PC.Print("/pc map probe | probe off (area-texture test squares on the world map)")
   PC.Print("/pc where (player position and the POI it is inside)")
@@ -1683,8 +1684,8 @@ local function PrintHelp()
   PC.Print("/pc hunt (hunting ground kills, last credited death and states)")
   PC.Print("/pc army (reserve, unit costs and whether you can recruit here)")
   PC.Print("/pc recruit <unit> [count] (in an Outpost or Settlement of your faction; footman, rifleman, mortar, scout)")
-  PC.Print("/pc garrison (garrison, Settlement level and fund of the place you stand in)")
-  PC.Print("/pc donate <unit|gold|wood> [count] confirm (irreversible gift to the garrison or Settlement fund)")
+  PC.Print("/pc garrison (garrison, Settlement level and War Chest of the place you stand in)")
+  PC.Print("/pc pledge <unit|gold|wood> [count] confirm (irreversible gift to the garrison or Settlement War Chest)")
   PC.Print("/pc scout [POI id] (scouting status and targets, or send your scout to an enemy Outpost or Settlement)")
   PC.Print("/pc attack [POI id footmen riflemen mortars] (armies and battles, or send an army to a discovered enemy place)")
   PC.Print("/pc p2p status")
@@ -1786,6 +1787,14 @@ local function SlashCommand(message)
     PC.MainWindow:Toggle()
     return
   end
+  if string.lower(scope) == "classic" then
+    if not PC.ClassicWindow or not PC.ClassicWindow.Toggle then
+      PC.Print("the classic PandaConquest window is unavailable (restart the client after an update)")
+      return
+    end
+    PC.ClassicWindow:Toggle()
+    return
+  end
   if string.lower(scope or "") == "map" then
     if not PC.Map or not PC.Map.GetStatus then
       PC.Print("map renderer is unavailable")
@@ -1800,10 +1809,30 @@ local function SlashCommand(message)
       .. " icons=" .. tostring(status.icons)
       .. " building=" .. tostring(status.building)
       .. " failures=" .. tostring(status.failures))
+    if PC.MinimapAreas then
+      local mini = PC.MinimapAreas:GetStatus()
+      PC.Print("minimap zone=" .. tostring(mini.zone or "none")
+        .. " patches=" .. tostring(mini.patches) .. " icons=" .. tostring(mini.icons)
+        .. " indoor=" .. tostring(mini.indoor))
+    end
     local option = string.lower(rest or "")
     if option == "hover" then
       PC.Print("hover " .. tostring(PC.Map.hoverDebug or "no sample yet (open the map)"))
       PC.Print("last tooltip " .. tostring(PC.Map.tooltipDebug or "none yet (hover an area)"))
+    elseif option == "hover probe" or option == "hover probe off" then
+      PC.Map:SetHoverProbe(option == "hover probe")
+      if option == "hover probe" then
+        PC.Print("hover probe on: sweep the cursor over the areas, then /pc map hover report")
+      else
+        PC.Print("hover probe off")
+      end
+    elseif option == "hover report" then
+      local lines = PC.Map:HoverProbeReport()
+      local index = 1
+      while index <= table.getn(lines) do
+        PC.Print(lines[index])
+        index = index + 1
+      end
     elseif option == "probe" or option == "probe off" then
       local ok, shown, detail = pcall(PC.Map.ShowProbe, PC.Map, option == "probe")
       PC.Print("map probe " .. (ok and tostring(shown) or "error") .. " "
@@ -1820,6 +1849,22 @@ local function SlashCommand(message)
       return
     end
     PC.Presence:PrintStatus()
+    return
+  end
+  if string.lower(scope or "") == "companion" then
+    if not PC.Companion then
+      PC.Print("companion guard is unavailable (restart the client after an update)")
+      return
+    end
+    PC.Companion:PrintStatus()
+    return
+  end
+  if string.lower(scope or "") == "fileprobe" then
+    if not PC.FileProbe then
+      PC.Print("file probe is unavailable (restart the client after an update)")
+      return
+    end
+    PC.FileProbe:Command(rest)
     return
   end
   if string.lower(scope or "") == "res" or string.lower(scope or "") == "resources" then
@@ -1842,13 +1887,13 @@ local function SlashCommand(message)
     end
     return
   end
-  if string.lower(scope or "") == "garrison" or string.lower(scope or "") == "donate" then
+  if string.lower(scope or "") == "garrison" or string.lower(scope or "") == "pledge" then
     if not PC.Garrison or not PC.Garrison.PrintStatus then
       PC.Print("garrisons are unavailable")
       return
     end
-    if string.lower(scope) == "donate" then
-      PC.Garrison:DonateCommand(rest)
+    if string.lower(scope) == "pledge" then
+      PC.Garrison:PledgeCommand(rest)
     else
       PC.Garrison:PrintStatus()
     end

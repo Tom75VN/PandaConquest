@@ -24,6 +24,7 @@ local MAX_SENDER = 64
 local MAX_POI = 16
 local MAX_GENERATION = 1000000
 local KINDS = { CAPTURED = true }
+local OWNERS = { H = true, A = true }
 
 Witness.MAX_ENTRIES = MAX_ENTRIES
 
@@ -91,12 +92,15 @@ end
 -- One observation, idempotent by (level, sender, kind, POI, generation): the
 -- same message delivered twice, or reported again later, is stored once.
 -- Returns true when a new entry was added.
-function Witness:Note(sender, kind, poi, generation)
+-- owner: the faction code (H/A) the capture gave the POI, read by the cloud
+-- owner ledger (decision 0060). The player's own captures are noted with the
+-- player as sender: the Worker treats them as claims, never as witness reports.
+function Witness:Note(sender, kind, poi, generation, owner)
   if type(sender) ~= "string" or sender == "" or string.len(sender) > MAX_SENDER
       or not string.find(sender, "@", 1, true) or not KINDS[kind]
       or type(poi) ~= "string" or poi == "" or string.len(poi) > MAX_POI
       or type(generation) ~= "number" or generation < 1 or generation > MAX_GENERATION
-      or generation ~= math.floor(generation) then
+      or generation ~= math.floor(generation) or (owner ~= nil and not OWNERS[owner]) then
     self.refused = self.refused + 1
     return false
   end
@@ -112,7 +116,7 @@ function Witness:Note(sender, kind, poi, generation)
   bucket.next = bucket.next + 1
   table.insert(bucket.entries, {
     n = bucket.next, pc = level, version = PC.version,
-    sender = sender, kind = kind, poi = poi, generation = generation,
+    sender = sender, kind = kind, poi = poi, generation = generation, owner = owner,
   })
   keys[key] = true
   while table.getn(bucket.entries) > MAX_ENTRIES do

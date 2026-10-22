@@ -411,8 +411,9 @@ function Stock:UpdateHere(now, force)
     here.status, here.reason, here.nextGatherAt = nil, "faction unknown", nil
     return
   end
-  if not capture:CanTalk() then
-    here.status, here.reason, here.nextGatherAt = nil, capture.LEVEL_REASON, nil
+  local talk, lockReason = capture:CanTalk()
+  if not talk then
+    here.status, here.reason, here.nextGatherAt = nil, lockReason, nil
     return
   end
   local status, reason = capture:Eligibility()
@@ -552,7 +553,7 @@ function Stock:View(id, now)
   local level = st and Stock.Level(st, info, now) or info.capacity
   local n = st and st.n or 0
   local known = st ~= nil and (st.known or st.restored)
-  local status
+  local status, fullIn
   if not known then
     status = "Not observed yet: full unless gathered"
   elseif n > 0 then
@@ -560,11 +561,13 @@ function Stock:View(id, now)
   elseif level >= info.capacity then
     status = "Full"
   else
-    status = "Regenerating, full in " .. Duration((info.capacity - level) * 60 / info.regen)
+    fullIn = (info.capacity - level) * 60 / info.regen
+    status = "Regenerating, full in " .. Duration(fullIn)
   end
   return {
     id = id, resource = info.resource, name = info.name, level = level, capacity = info.capacity,
-    n = n, known = known, status = status, here = self.here ~= nil and self.here.id == id,
+    n = n, known = known, status = status, fullIn = fullIn,
+    here = self.here ~= nil and self.here.id == id,
   }
 end
 

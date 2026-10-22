@@ -74,6 +74,8 @@ Attack.ASSAULT = { min = ASSAULT_MIN, max = ASSAULT_MAX }
 Attack.COUNTER_PCT = COUNTER_PCT
 Attack.LOCK_MAX = LOCK_MAX
 Attack.FINAL_APPROACH = FINAL_APPROACH
+Attack.UNIT_ORDER = UNIT_ORDER
+Attack.FIELDS = FIELDS
 
 local function Now()
   local now = PC.Now and PC.Now() or 0
@@ -163,6 +165,8 @@ local function Composition(counts, fac)
   if table.getn(parts) == 0 then return "nothing" end
   return table.concat(parts, ", ")
 end
+
+Attack.Composition = Composition
 
 Attack.Composition = Composition
 
@@ -279,6 +283,8 @@ local function Size(army)
   return army.f * units.FOOTMAN.size + army.r * units.RIFLEMAN.size + army.m * units.MORTAR.size
 end
 
+Attack.Size = Size
+
 -- Records -------------------------------------------------------------------
 
 local function Arrival(r)
@@ -300,9 +306,9 @@ function Attack:Mine(now)
   return nil
 end
 
--- Why units cannot be donated to garrison id right now (decision 0052), or
+-- Why units cannot be pledged to garrison id right now (decision 0052), or
 -- nil: the post-combat lock, an enemy army in its last two minutes of march,
--- or a battle waiting to be resolved. The upgrade fund ignores this.
+-- or a battle waiting to be resolved. The War Chest ignores this.
 function Attack:Freeze(id, now)
   now = now or Now()
   local garrison = PC.Garrison
@@ -498,7 +504,8 @@ function Attack:Check(targetId, army, now)
     index = index + 1
   end
   if total < 1 then return nil, "choose at least one combat unit" end
-  if not PC.Capture:CanTalk() then return nil, PC.Capture.LEVEL_REASON or "you cannot speak on the channel yet" end
+  local talk, lockReason = PC.Capture:CanTalk()
+  if not talk then return nil, lockReason or "you cannot speak on the channel yet" end
   local mine = self:Mine(now)
   if mine then
     if Arrival(mine) > now then return nil, "your army is still marching (" .. Clock(Arrival(mine) - now) .. " left)" end

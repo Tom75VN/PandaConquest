@@ -9,7 +9,7 @@ PC.Army = Army
 -- docs/game-design.md §§ 6-7). Private and local: never sent on the channel.
 -- Values from the V1 balance sheet (decision 0047, tools/balance_sim.py
 -- BALANCE): one entry per unit, the same for both factions, only the names
--- differ. Units leave the reserve as garrison donations (modules/garrison.lua),
+-- differ. Units leave the reserve as garrison pledges (modules/garrison.lua),
 -- scouts (modules/scout.lua) or attacking armies (modules/attack.lua).
 local SCHEMA = 1
 local RESERVE_CAPACITY = 25
@@ -123,8 +123,8 @@ function Army:Reserve()
   local op = math.floor(tonumber(reserve.op) or 0)
   if op < 0 or op > 1000000000 then op = 0 end
   reserve.op = op
-  -- Garrison donations (modules/garrison.lua): their own operation number and
-  -- at most one donation waiting for the keeper's answer.
+  -- Garrison pledges (modules/garrison.lua): their own operation number and
+  -- at most one pledge waiting for the keeper's answer.
   local gop = math.floor(tonumber(reserve.gop) or 0)
   if gop < 0 or gop > 1000000000 then gop = 0 end
   reserve.gop = gop

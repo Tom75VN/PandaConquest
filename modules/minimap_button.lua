@@ -12,7 +12,7 @@ PC.MinimapButton = Button
 local NAME = "PandaConquestMinimapButton"
 local DEFAULT_ANGLE = 200
 local RADIUS = 80
-local FACTION_KEYS = { H = "HORDE", A = "ALLIANCE" }
+local SIZE = 32
 
 Button.DEFAULT_ANGLE = DEFAULT_ANGLE
 
@@ -89,33 +89,29 @@ function Button:Build()
   local ok, frame = pcall(create, "Button", NAME, minimap)
   if not ok or not frame then return nil end
   self.frame = frame
-  frame:SetWidth(31)
-  frame:SetHeight(31)
+  frame:SetWidth(SIZE)
+  frame:SetHeight(SIZE)
   frame:SetFrameStrata("MEDIUM")
   frame:SetFrameLevel(minimap:GetFrameLevel() + 8)
-  frame:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
 
-  -- The Outpost icon of the map atlas, in the player's faction colour.
-  local map = PC.Map
-  local icon = frame:CreateTexture(nil, "BACKGROUND")
-  icon:SetWidth(20)
-  icon:SetHeight(20)
-  icon:SetPoint("TOPLEFT", frame, "TOPLEFT", 6, -6)
-  if map and map.POI_ICONS and type(map.GetIconTexCoord) == "function" then
-    local faction = PC.Capture and PC.Capture:MyFaction()
-    local coords = map.GetIconTexCoord("OUTPOST", FACTION_KEYS[faction or ""])
-    icon:SetTexture(map.POI_ICONS.OUTPOST)
-    icon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+  -- The gold ring with the panda emblem; pushed while held, a glow on mouse-over.
+  local skin = PC.Skin
+  local icon = frame:CreateTexture(nil, "ARTWORK")
+  icon:SetWidth(SIZE)
+  icon:SetHeight(SIZE)
+  icon:SetPoint("CENTER", frame, "CENTER", 0, 0)
+  if skin then
+    skin:Apply(icon, "minimap.normal")
+    local glow = skin:Icon(frame, "minimap.hover", SIZE + 6, SIZE + 6, "HIGHLIGHT")
+    glow:SetPoint("CENTER", frame, "CENTER", 0, 0)
+    glow:SetBlendMode("ADD")
   end
   self.icon = icon
-  local border = frame:CreateTexture(nil, "OVERLAY")
-  border:SetWidth(52)
-  border:SetHeight(52)
-  border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
-  border:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
 
   frame:RegisterForClicks("LeftButtonUp")
   frame:RegisterForDrag("LeftButton")
+  frame:SetScript("OnMouseDown", function() if PC.Skin then PC.Skin:Apply(Button.icon, "minimap.pushed") end end)
+  frame:SetScript("OnMouseUp", function() if PC.Skin then PC.Skin:Apply(Button.icon, "minimap.normal") end end)
   frame:SetScript("OnClick", function() Button:OnClick() end)
   frame:SetScript("OnDragStart", function()
     this:LockHighlight()

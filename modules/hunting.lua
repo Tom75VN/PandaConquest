@@ -149,7 +149,8 @@ local function Apply(st, side)
     st.progress = st.progress + STEP
     if st.progress >= 1000 then
       st.owner = side
-      st.generation = st.generation + 1
+      -- Above every generation known here, cloud and hints included (decision 0060).
+      st.generation = Capture:NextGeneration(st.id, st.generation)
       st.challenger, st.progress = "-", 0
       st.ver = 0
       return "CAPTURED", true
@@ -224,16 +225,17 @@ end
 
 -- Applies one kill to the local state, then lets a peer that is ahead replace it.
 -- The capturing kill: the killer's bar at rest, owned by its faction, one
--- generation above ours. Anything further is a capture we did not see.
-local function Capturing(claimed, side, generation)
-  return claimed.generation == generation + 1 and claimed.ver == 0 and claimed.owner == side
-    and claimed.challenger == "-"
+-- generation above the largest we know (Capture:Floor, decision 0060). Anything
+-- further is a capture we did not see.
+local function Capturing(claimed, side, st)
+  return claimed.generation == Capture:Floor(st.id, st.generation) + 1 and claimed.ver == 0
+    and claimed.owner == side and claimed.challenger == "-"
 end
 
 -- sender: the chat sender of a K, nil for a local kill.
 function Hunting:Credit(id, side, guid, claimed, now, source, sender)
   local st = self:GetState(id)
-  if claimed and claimed.generation > st.generation and not Capturing(claimed, side, st.generation) then
+  if claimed and claimed.generation > st.generation and not Capturing(claimed, side, st) then
     -- A generation jump is only a hint (decision 0038): the bar does not move.
     self:Remember(guid, now)
     if sender and FACTION_KEYS[claimed.owner] then
@@ -264,6 +266,10 @@ function Hunting:Credit(id, side, guid, claimed, now, source, sender)
     Capture:HandleEvent(id, "START", side, now)
   elseif event == "CAPTURED" then
     Capture:HandleEvent(id, "CAPTURED", st.owner, now, st.generation)
+    -- Our own capturing kill: a claim for the cloud owner ledger (decision 0060).
+    if not claimed and source == "LOCAL" and PC.Witness then
+      PC.Witness:Note(Capture:Me(), "CAPTURED", id, st.generation, st.owner)
+    end
   end
   return event, changed
 end
@@ -291,8 +297,9 @@ function Hunting:OnUnitDied(rawGuid)
   if self.here then self.last = { guid = guid, entry = entry, ok = ok, reason = reason } end
   if not ok then return false end
   -- A kill nobody could hear of must not move the local bar either.
-  if not Capture:CanTalk() then
-    self.last.ok, self.last.reason = false, Capture.LEVEL_REASON
+  local talk, lockReason = Capture:CanTalk()
+  if not talk then
+    self.last.ok, self.last.reason = false, lockReason
     return false
   end
   local faction = Capture:MyFaction()
@@ -374,14 +381,15 @@ function Hunting:OnMessage(kind, parts, sender, now)
   local f = ParseClaim(parts, 4)
   if not FACTION_KEYS[faction] or not guid or not f then return Capture:Reject("bad K", sender) end
   if f.generation < st.generation then return Capture:Reject("old generation", sender) end
-  local generation = st.generation
+  -- Taken before the credit: the capturing kill is adopted one above it (decision 0060).
+  local base = Capture:Floor(id, st.generation)
   self:Credit(id, faction, guid, f, now, "PEER", sender)
   -- Only the capturing kill leaves the sender's bar at rest, owned by its
   -- faction, at version 0 (Apply); the H relay is never a witness, nor a
   -- generation jump kept as a hint (decision 0038).
-  if f.ver == 0 and f.owner == faction and f.challenger == "-" and f.generation <= generation + 1
+  if f.ver == 0 and f.owner == faction and f.challenger == "-" and f.generation <= base + 1
       and PC.Witness then
-    PC.Witness:Note(sender, "CAPTURED", id, f.generation)
+    PC.Witness:Note(sender, "CAPTURED", id, f.generation, f.owner)
   end
   return true
 end
@@ -404,9 +412,17 @@ end
 
 -- Saved bars follow the registry: a bar from an older generation is dropped.
 function Hunting:Restore(bucket)
+  local id, entry, st
+  -- A ground entered before the registry loaded (/reload inside it) follows it.
+  for id, st in pairs(self.states) do
+    local owner, generation = Capture:GetOwner(id)
+    if not st.known and generation > st.generation then
+      st.owner, st.generation = owner, generation
+      st.challenger, st.progress, st.ver = "-", 0, 0
+    end
+  end
   local saved = bucket.hunting
   if type(saved) ~= "table" then return end
-  local id, entry
   for id, entry in pairs(saved) do
     local st = self.states[id]
     if type(entry) == "table" and self:Area(id) and not (st and st.known) then
@@ -459,7 +475,11 @@ function Hunting:UpdateMap()
         half = FACTION_KEYS[st.challenger]
       end
       local hint = Capture:BestHint(id, Now())
-      if hint then
+      local cloud = Capture:CloudHint(id)
+      if cloud and hint and hint.generation >= cloud.g then cloud = nil end
+      if cloud and cloud.o then
+        map:SetCaptureView(id, FACTION_KEYS[cloud.o], nil, true)
+      elseif hint then
         map:SetCaptureView(id, FACTION_KEYS[hint.owner], nil, true)
       else
         map:SetCaptureView(id, FACTION_KEYS[owner], half)
@@ -543,7 +563,7 @@ function Hunting:GetHud()
   view.mode = "H"
   local warning = nil
   if not Capture:CanTalk() then
-    warning = "You cannot capture: " .. Capture.LEVEL_REASON
+    warning = "You cannot capture: " .. tostring(Capture:LockReason())
   elseif not self:Area(here.id) then
     warning = "No creature listed here: cannot be captured yet"
   elseif not self:CanDetectDeaths() then

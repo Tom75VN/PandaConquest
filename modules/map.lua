@@ -44,42 +44,38 @@ Map.RESOURCE_TYPES = {
   FARM = true,
 }
 
--- 512x512 RLE atlas built by tools/make_poi_icon_atlas.py: this client draws
--- large uncompressed TGA atlases as diagonal bands.
-local POI_ICON_TEXTURE =
-  "Interface\\AddOns\\pandaConquest\\media\\Textures\\Icons\\MapPOIIconAtlas"
-local POI_ICON_CELL = 72 / 512
+-- Every POI picture comes from one 512 x 512 RLE atlas of 72 px cells, built
+-- by tools/make_poi_icon_atlas.py (this client draws large uncompressed TGA
+-- atlases as diagonal bands). Rows: hunting grounds, outpost, Settlement levels
+-- 1 to 3, resources. Columns: 0 neutral, 1 half Horde, 2 Horde, 3 half
+-- Alliance, 4 Alliance.
+local POI_ICON_ATLAS = "Interface\\AddOns\\pandaConquest\\media\\Textures\\Icons\\MapPOIIconAtlas"
+local POI_ICON_ATLAS_SIZE = 512
+local POI_ICON_CELL = 72
 
-Map.POI_ICONS = {
-  OUTPOST = POI_ICON_TEXTURE,
-  SETTLEMENT = POI_ICON_TEXTURE,
-  HUNTING_GROUNDS = POI_ICON_TEXTURE,
-  GOLD_MINE = POI_ICON_TEXTURE,
-  FOREST = POI_ICON_TEXTURE,
-  FARM = POI_ICON_TEXTURE,
-}
-
--- Controlled POIs occupy one row each; all resources share the last row.
+-- First row of each type; a Settlement adds its level minus one.
 Map.POI_ICON_ROWS = {
   HUNTING_GROUNDS = 0,
   OUTPOST = 1,
   SETTLEMENT = 2,
-GOLD_MINE = 4,
-FOREST = 4,
-FARM = 4,
+  GOLD_MINE = 5,
+  FOREST = 5,
+  FARM = 5,
 }
+
+-- Resource POIs have one permanent picture each, packed onto their shared row.
+Map.POI_ICON_RESOURCE_COLUMNS = {
+  GOLD_MINE = 0,
+  FOREST = 1,
+  FARM = 2,
+}
+
+Map.POI_ICON_STATES = { [0] = "neutral", [1] = "half_horde", [2] = "horde", [3] = "half_alliance", [4] = "alliance" }
 
 -- Columns are capture states for controlled POIs.
 Map.POI_ICON_COLUMNS = {
   HORDE = 2,
   ALLIANCE = 4,
-}
-
--- Resource POIs have one permanent icon each, packed onto their shared row.
-Map.POI_ICON_RESOURCE_COLUMNS = {
-  GOLD_MINE = 0,
-  FOREST = 1,
-  FARM = 2,
 }
 
 -- Half-captured columns, shown while a challenger holds 50 % or more.
@@ -88,18 +84,28 @@ Map.POI_ICON_HALF_COLUMNS = {
   ALLIANCE = 3,
 }
 
-function Map.GetIconTexCoord(poiType, colorKey, column)
+-- Texture path, coordinates (left, right, top, bottom) and pixel size of a
+-- POI picture; level is a held Settlement's level. nil for an unknown type.
+function Map.GetIcon(poiType, colorKey, column, level)
   local row = Map.POI_ICON_ROWS[poiType]
-  if not row then return { 0, 1, 0, 1 } end
+  if not row then return nil end
   if Map.RESOURCE_TYPES[poiType] then
     column = Map.POI_ICON_RESOURCE_COLUMNS[poiType] or 0
   else
     column = column or Map.POI_ICON_COLUMNS[colorKey or ""] or 0
+    if not Map.POI_ICON_STATES[column] then column = 0 end
+    if poiType == "SETTLEMENT" then row = row + math.max(1, math.min(3, level or 1)) - 1 end
   end
-  return {
-    column * POI_ICON_CELL, (column + 1) * POI_ICON_CELL,
-    row * POI_ICON_CELL, (row + 1) * POI_ICON_CELL,
-  }
+  local cell = POI_ICON_CELL / POI_ICON_ATLAS_SIZE
+  local left, top = column * cell, row * cell
+  return POI_ICON_ATLAS, left, left + cell, top, top + cell, POI_ICON_CELL, POI_ICON_CELL
+end
+
+-- Width and height of a picture of w x h pixels drawn in a square of `size`.
+function Map.FitIcon(size, w, h)
+  if not w or not h or w <= 0 or h <= 0 then return size, size end
+  if w >= h then return size, size * h / w end
+  return size * w / h, size
 end
 
 local PROFILE_TEXTURE =
@@ -110,6 +116,13 @@ local PROFILE_ALPHA = 1.00
 local HOVER_ALPHA = 0.50
 local HOVER_INTERVAL = 0.05
 local POI_ICON_SIZE = 28
+-- Types drawn at another size than POI_ICON_SIZE, as a size multiplier.
+local POI_ICON_SCALE = {
+  SETTLEMENT = 1.15,
+}
+local function IconSize(poiType)
+  return POI_ICON_SIZE * (POI_ICON_SCALE[poiType] or 1)
+end
 -- Half-width of the icon hover square, as a share of the icon size (the art
 -- leaves a transparent margin, so the full 0.5 would catch empty corners).
 local ICON_HIT_RATIO = 0.4
@@ -321,6 +334,9 @@ end
 local function HideEntry(entry)
   HideHoverPatches(entry)
   if entry and entry.icon then HideObject(entry.icon) end
+  if entry and entry.stockLabel then HideObject(entry.stockLabel) end
+  if entry and entry.stockBarBack then HideObject(entry.stockBarBack) end
+  if entry and entry.stockBarFill then HideObject(entry.stockBarFill) end
   if entry and entry.frame then HideObject(entry.frame) end
   if entry then
     entry.active = false
@@ -428,6 +444,7 @@ end
 function Map:RemoveArea(id)
   if type(id) ~= "string" or not self.areas[id] then return false end
   self.areas[id] = nil
+  if self.shadows then self.shadows[id] = nil end
   local entry = self.groups[id]
   if entry then
     entry.pending = nil
@@ -615,11 +632,147 @@ end
 -- Also the anchor of travel distances (modules/scout.lua, decision 0050).
 Map.IconPosition = GetIconPosition
 
+-- "level/capacity" of a resource POI (modules/stock.lua) and its fill share
+-- in [0, 1], nil for other types.
+local function StockText(area)
+  local stock = PC.Stock
+  if not stock or type(stock.View) ~= "function" then return nil end
+  local ok, view = pcall(stock.View, stock, area.id)
+  if not ok or type(view) ~= "table" then return nil end
+  local level, capacity = math.floor(view.level), math.floor(view.capacity)
+  local share = 0
+  if capacity > 0 then share = math.max(0, math.min(1, level / capacity)) end
+  return level .. "/" .. capacity, share
+end
+
+-- Small stock bar under the label: dark background, fill from red (empty)
+-- to green (full). Local display only.
+local STOCK_BAR_TEXTURE = "Interface\\Buttons\\WHITE8X8"
+local STOCK_BAR_WIDTH = 30
+local STOCK_BAR_HEIGHT = 3
+
+local function HideStockBar(entry)
+  if entry.stockBarBack then HideObject(entry.stockBarBack) end
+  if entry.stockBarFill then HideObject(entry.stockBarFill) end
+end
+
+local function PlaceStockBar(entry, share)
+  if not entry.stockBarBack then
+    if type(entry.frame.CreateTexture) ~= "function" then return end
+    local ok = pcall(function()
+      local back = entry.frame:CreateTexture(nil, "ARTWORK")
+      back:SetTexture(STOCK_BAR_TEXTURE)
+      back:SetVertexColor(0, 0, 0, 0.7)
+      back:SetWidth(STOCK_BAR_WIDTH + 2)
+      back:SetHeight(STOCK_BAR_HEIGHT + 2)
+      back:SetPoint("TOP", entry.stockLabel, "BOTTOM", 0, -2)
+      local fill = entry.frame:CreateTexture(nil, "OVERLAY")
+      fill:SetTexture(STOCK_BAR_TEXTURE)
+      fill:SetHeight(STOCK_BAR_HEIGHT)
+      fill:SetPoint("LEFT", back, "LEFT", 1, 0)
+      entry.stockBarBack = back
+      entry.stockBarFill = fill
+    end)
+    if not ok then return end
+  end
+  local back, fill = entry.stockBarBack, entry.stockBarFill
+  pcall(function()
+    back:Show()
+    if share <= 0 then
+      fill:Hide()
+      return
+    end
+    fill:SetWidth(math.max(1, STOCK_BAR_WIDTH * share))
+    fill:SetVertexColor(1 - share, share, 0, 0.9)
+    fill:Show()
+  end)
+end
+
+-- "Level n" of a Settlement held by a faction (modules/garrison.lua), nil
+-- otherwise. Read from the garrison state of the current owner generation,
+-- never created here: no state yet means level 1.
+local function SettlementLevel(area)
+  local garrison, capture = PC.Garrison, PC.Capture
+  if area.type ~= "SETTLEMENT" or not garrison or not capture or type(garrison.Level) ~= "function" then
+    return nil
+  end
+  local ok, owner, generation = pcall(capture.GetOwner, capture, area.id)
+  if not ok or (owner ~= "H" and owner ~= "A") then return nil end
+  local st = garrison.states and garrison.states[area.id]
+  if not st or st.gen ~= generation then return 1 end
+  return garrison.Level(st.gold, st.wood)
+end
+
+local function LevelText(area)
+  local level = SettlementLevel(area)
+  return level and ("Level " .. level) or nil
+end
+
+Map.SettlementLevel = SettlementLevel
+Map.LevelText = LevelText
+
+-- Settlement levels change between layouts: switch the icon row only when the
+-- level does (the layout itself sets it in PlaceIcon).
+local function RefreshLevelIcon(entry, area)
+  if area.type ~= "SETTLEMENT" or not entry.iconShown or not entry.icon then return end
+  local level = SettlementLevel(area)
+  if entry.icon.pandaConquestLevel == level then return end
+  local path, left, right, top, bottom = Map.GetIcon(area.type, area.colorKey, area.iconColumn, level)
+  if not path then return end
+  local ok = pcall(function()
+    if entry.icon.pandaConquestPath ~= path then
+      entry.icon:SetTexture(path)
+      entry.icon.pandaConquestPath = path
+    end
+    entry.icon:SetTexCoord(left, right, top, bottom)
+  end)
+  if ok then entry.icon.pandaConquestLevel = level end
+end
+
+-- Label under the icon of a resource POI (its stock) or of a held Settlement
+-- (its level); anchored once to the icon, its text is set only when it
+-- changes. Only a stock draws the bar.
+local function PlaceStockLabel(entry, area)
+  local text, share
+  if entry.iconShown then
+    text, share = StockText(area)
+    if not text then text = LevelText(area) end
+  end
+  if not text then
+    if entry.stockLabel then HideObject(entry.stockLabel) end
+    HideStockBar(entry)
+    return
+  end
+  if not entry.stockLabel then
+    if type(entry.frame.CreateFontString) ~= "function" then return end
+    local ok, label = pcall(entry.frame.CreateFontString, entry.frame, nil, "OVERLAY",
+      "GameFontHighlightSmall")
+    if not ok or not label then return end
+    local anchored = pcall(function()
+      label:SetPoint("TOP", entry.icon, "BOTTOM", 0, 3)
+    end)
+    if not anchored then return end
+    entry.stockLabel = label
+  end
+  local label = entry.stockLabel
+  pcall(function()
+    if label.pandaConquestText ~= text then
+      label:SetText(text)
+      label.pandaConquestText = text
+    end
+    label:Show()
+  end)
+  if share then PlaceStockBar(entry, share) else HideStockBar(entry) end
+end
+
 local function PlaceIcon(entry, area, width, height)
-  local path = Map.POI_ICONS[area.type]
+  local level = SettlementLevel(area)
+  local path, left, right, top, bottom, pw, ph = Map.GetIcon(area.type, area.colorKey, area.iconColumn, level)
   entry.iconShown = false
   if not path then
     if entry.icon then HideObject(entry.icon) end
+    if entry.stockLabel then HideObject(entry.stockLabel) end
+    HideStockBar(entry)
     return true
   end
   if not entry.frame or type(entry.frame.CreateTexture) ~= "function" then return false end
@@ -641,15 +794,17 @@ local function PlaceIcon(entry, area, width, height)
       entry.icon:SetTexture(path)
       entry.icon.pandaConquestPath = path
     end
-    local texCoord = Map.GetIconTexCoord(area.type, area.colorKey, area.iconColumn)
-    entry.icon:SetTexCoord(texCoord[1], texCoord[2], texCoord[3], texCoord[4])
+    entry.icon:SetTexCoord(left, right, top, bottom)
+    entry.icon.pandaConquestLevel = level
     entry.icon:ClearAllPoints()
     entry.icon:SetPoint("CENTER", entry.frame, "TOPLEFT", x * width, -y * height)
-    entry.icon:SetWidth(POI_ICON_SIZE)
-    entry.icon:SetHeight(POI_ICON_SIZE)
+    local iconWidth, iconHeight = Map.FitIcon(IconSize(area.type), pw, ph)
+    entry.icon:SetWidth(iconWidth)
+    entry.icon:SetHeight(iconHeight)
     entry.icon:Show()
   end)
   entry.iconShown = ok and true or false
+  PlaceStockLabel(entry, area)
   return entry.iconShown
 end
 
@@ -747,6 +902,36 @@ function Map:StepBuildQueue()
   return true
 end
 
+-- Records of an area for the minimap (modules/minimap_areas.lua), whatever
+-- zone the world map shows: the world map's own records, the shared cache, or
+-- nil while its build is queued. Re-keyed only when the revision changes.
+Map.PROFILE_TEXTURE = PROFILE_TEXTURE
+Map.shadows = {}
+
+function Map:GetAreaRecords(area)
+  local shadow = self.shadows[area.id]
+  if not shadow then
+    shadow = {}
+    self.shadows[area.id] = shadow
+  end
+  if shadow.revision ~= self.revision then
+    shadow.revision = self.revision
+    local key = LayoutKey(area)
+    if shadow.layoutKey ~= key then
+      local entry = self.groups[area.id]
+      local cached = self.cache[key]
+      if entry and entry.layoutKey == key and entry.records then
+        shadow.layoutKey, shadow.pending, shadow.records = key, nil, entry.records
+      elseif cached then
+        shadow.layoutKey, shadow.pending, shadow.records = key, nil, BuildRecords(cached)
+      else
+        QueueBuild(shadow, area, key)
+      end
+    end
+  end
+  return shadow.records
+end
+
 -- Scout routes (roadmap WP8, docs/scouting.md, decision 0051) ----------------
 -- Every scout still travelling is drawn on the displayed zone map, for both
 -- factions and without its sender: a dotted straight line from its origin to
@@ -756,7 +941,7 @@ end
 -- continent (abstract sea crossing) and the continent maps show nothing.
 -- Local display only: nothing is sent.
 local ROUTE_TEXTURE = "Interface\\Buttons\\WHITE8X8"
-local ROUTE_DOT_SIZE = 3
+local ROUTE_DOT_SIZE = 5
 local ROUTE_DOT_GAP = 9
 local ROUTE_DOT_ALPHA = 0.9
 -- Dots this close to an endpoint would sit under its POI icon.
@@ -850,9 +1035,19 @@ local function LayoutDots(frame, slot, first, width, height)
       local dot = RouteTexture(dots, used + 1, frame, "ARTWORK")
       if not dot then return used end
       used = used + 1
-      if dot.pandaConquestPath ~= ROUTE_TEXTURE then
-        dot:SetTexture(ROUTE_TEXTURE)
-        dot.pandaConquestPath = ROUTE_TEXTURE
+      if not dot.pandaConquestPath then
+        -- The round white dot of the atlas, tinted below; a plain square without it.
+        local atlas = PC.UIAtlas
+        local piece = atlas and atlas.pieces["route.dot"]
+        if piece then
+          dot:SetTexture(atlas.pages[piece.p])
+          dot:SetTexCoord(piece.x / atlas.page, (piece.x + piece.w) / atlas.page, piece.y / atlas.page,
+            (piece.y + piece.h) / atlas.page)
+          dot.pandaConquestPath = atlas.pages[piece.p]
+        else
+          dot:SetTexture(ROUTE_TEXTURE)
+          dot.pandaConquestPath = ROUTE_TEXTURE
+        end
         dot:SetWidth(ROUTE_DOT_SIZE)
         dot:SetHeight(ROUTE_DOT_SIZE)
       end
@@ -1067,9 +1262,22 @@ local function ReapplyVisibleGroups()
         pcall(entry.frame.SetAllPoints, entry.frame, canvas)
       end
       if type(entry.frame.Show) == "function" then pcall(entry.frame.Show, entry.frame) end
+      -- Stocks and levels change between layouts: keep labels and icons current.
+      local area = Map.areas[Map.order[index]]
+      if area then
+        RefreshLevelIcon(entry, area)
+        PlaceStockLabel(entry, area)
+      end
     end
     index = index + 1
   end
+end
+
+-- Below level 5 the player cannot speak on the channel (decision 0039): the
+-- POI states they see would be stale or wrong, so the maps show nothing.
+function Map:Locked()
+  local capture = PC.Capture
+  return capture and capture.CanTalk and not capture:CanTalk() and true or false
 end
 
 function Map:Refresh(force)
@@ -1077,7 +1285,7 @@ function Map:Refresh(force)
   local mapName = GetCurrentMapFile()
   local mapKey = CanonicalMapName(mapName)
   local width, height = GetCanvasSize(canvas)
-  if not self.enabled or not Contours or not canvas or not mapKey or not width then
+  if not self.enabled or self:Locked() or not Contours or not canvas or not mapKey or not width then
     self:HideAll()
     self.lastSignature = nil
     return false
@@ -1151,6 +1359,7 @@ function Map:GetStatus()
   end
   return {
     enabled = self.enabled,
+    locked = self:Locked(),
     registered = table.getn(self.order),
     map = self.currentMap,
     visible = self.visibleCount,
@@ -1269,6 +1478,15 @@ local function ShowAreaTooltip(canvas, area)
       AddFactionLine(tooltip, "Unconfirmed", info.hint.owner, " (" .. info.hint.count .. " player(s), "
         .. FormatDuration(info.hint.age) .. " ago)")
     end
+    -- Cloud owner (decision 0060): shown only, never an owner for gameplay.
+    if info and info.cloud and PC.Capture then
+      local label, code, detail = PC.Capture.CloudLine(info.cloud)
+      if code then
+        AddFactionLine(tooltip, label, code, " (" .. detail .. ")")
+      else
+        tooltip:AddDoubleLine(label, detail, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
+      end
+    end
     if info and info.challenger then
       AddFactionLine(tooltip, "Capture", info.challenger, " " .. info.percent .. "%")
     end
@@ -1367,14 +1585,15 @@ function Map:FindAreaAt(x, y, width, height)
   -- Icons draw above every area and may overhang their own zone (the bounding-box
   -- middle can fall outside a concave one), so the cursor on an icon picks it first.
   if width and height then
-    local reachX = POI_ICON_SIZE * ICON_HIT_RATIO / width * 100
-    local reachY = POI_ICON_SIZE * ICON_HIT_RATIO / height * 100
     index = table.getn(self.order)
     while index >= 1 do
       local id = self.order[index]
       local area = self.areas[id]
       local entry = self.groups[id]
       if area and entry and entry.active and entry.iconShown and area.mapKey == mapKey then
+        local reach = IconSize(area.type) * ICON_HIT_RATIO
+        local reachX = reach / width * 100
+        local reachY = reach / height * 100
         local iconX, iconY = GetIconPosition(area)
         if iconX and math.abs(x - iconX * 100) <= reachX
             and math.abs(y - iconY * 100) <= reachY then
@@ -1400,11 +1619,22 @@ function Map:FindAreaAt(x, y, width, height)
 end
 
 -- True when the mouse is over the map itself: the canvas, or a frame that holds it
--- (WorldMapDetailFrame, WorldMapFrame). Buttons drawn on the canvas and unrelated
--- frames above the map block the hover.
+-- (WorldMapDetailFrame, WorldMapFrame). WorldFrame (the 3D world, reported over
+-- parts of the open map) and Blizzard's landmark buttons (WorldMapFramePOI<n>,
+-- 32x32, they only rename the area label) count as the map: measured on OctoWoW,
+-- they swallowed most of the hover over EFST01, EFGM04 and EFFA09. Unit dots
+-- (WorldMapPlayer, party, raid) share WorldMapTooltip and still block the hover,
+-- as do unrelated frames above the map.
 local function MapHasFocus(canvas, focus)
   if focus == canvas then return true end
   if not focus then return false end
+  if focus == GetGlobal("WorldFrame") then return true end
+  if type(focus.GetName) == "function" then
+    local nameOk, name = pcall(focus.GetName, focus)
+    if nameOk and type(name) == "string" and string.find(name, "^WorldMapFramePOI%d+$") then
+      return true
+    end
+  end
   local node = canvas
   local depth = 0
   while node and depth < 10 do
@@ -1499,6 +1729,145 @@ function Map:UpdateHover()
   self.tooltipDebug = id .. " " .. TooltipProbe(self.tooltipShown)
 end
 
+-- Hover probe (/pc map hover probe | report | probe off). While on, each hover
+-- sample with the cursor inside a drawn shape is counted for that area, and a
+-- sample whose hover differs from the shape under the cursor keeps its reason.
+-- Bounded, and saved in PandaConquestDB.hoverProbe so /reload makes it readable.
+local HOVER_PROBE_SAMPLES = 150
+
+local function ShapeAreaAt(self, x, y)
+  local mapKey = CanonicalMapName(self.currentMap)
+  local index = table.getn(self.order)
+  while index >= 1 do
+    local id = self.order[index]
+    local area = self.areas[id]
+    if area and area.enabled and area.mapKey == mapKey
+        and Contours.AreaContainsPoint(area, x, y) then
+      return id
+    end
+    index = index - 1
+  end
+  return nil
+end
+
+local function ProbeFocusLabel(focus)
+  local label = FrameLabel(focus)
+  if focus and label == "unnamed" and type(focus.GetParent) == "function" then
+    local ok, parent = pcall(focus.GetParent, focus)
+    if ok and parent then label = "unnamed<" .. FrameLabel(parent) end
+  end
+  return label
+end
+
+local function Round2(value)
+  return math.floor(value * 100 + 0.5) / 100
+end
+
+function Map:SetHoverProbe(enabled)
+  if not enabled then
+    self.hoverProbe = nil
+    return
+  end
+  local probe = { areas = {}, samples = {}, dropped = 0 }
+  self.hoverProbe = probe
+  local db = PC.Storage and PC.Storage.GetDB and PC.Storage:GetDB()
+  if type(db) == "table" then db.hoverProbe = probe end
+end
+
+local function HoverMissReason(self, canvas, focus, shapeId, x, y, width, height)
+  local hoverId = self.hoverId
+  if focus and not MapHasFocus(canvas, focus) then return "focus:" .. ProbeFocusLabel(focus) end
+  if not shapeId then return "outsideShape:" .. tostring(hoverId) end
+  local entry = self.groups[shapeId]
+  if not entry then return "noEntry" end
+  if not entry.active then return "inactive" end
+  if not entry.records then return entry.pending and "building" or "noRecords" end
+  local found = self:FindAreaAt(x, y, width, height)
+  if hoverId and found == hoverId then return "icon:" .. hoverId end
+  if found == shapeId then return "notApplied:" .. tostring(hoverId) end
+  return "found:" .. tostring(found) .. ":" .. tostring(hoverId)
+end
+
+function Map:ProbeHover()
+  local probe = self.hoverProbe
+  local canvas = GetCanvas()
+  local width, height = GetCanvasSize(canvas)
+  if not probe or not width or not self.currentMap or not Contours then return end
+  local x, y = CursorOnCanvas(canvas, width, height)
+  if not x then return end
+  local shapeId = ShapeAreaAt(self, x, y)
+  local hoverId = self.hoverId
+  if not shapeId and not hoverId then return end
+
+  local key = shapeId or hoverId
+  local stats = probe.areas[key]
+  if not stats then
+    stats = { inside = 0, hovered = 0, missed = 0, reasons = {} }
+    probe.areas[key] = stats
+  end
+  if shapeId then stats.inside = stats.inside + 1 end
+  if shapeId == hoverId then
+    stats.hovered = stats.hovered + 1
+    return
+  end
+
+  local getFocus = GetGlobal("GetMouseFocus")
+  local focus = nil
+  if type(getFocus) == "function" then
+    local ok, frame = pcall(getFocus)
+    if ok then focus = frame end
+  end
+  local reason = HoverMissReason(self, canvas, focus, shapeId, x, y, width, height)
+  stats.missed = stats.missed + 1
+  stats.reasons[reason] = (stats.reasons[reason] or 0) + 1
+
+  -- One sample per reason and cursor spot, so a still cursor fills nothing.
+  if probe.lastReason == reason and probe.lastArea == key
+      and math.abs(probe.lastX - x) < 0.5 and math.abs(probe.lastY - y) < 0.5 then
+    return
+  end
+  probe.lastReason, probe.lastArea, probe.lastX, probe.lastY = reason, key, x, y
+  if table.getn(probe.samples) >= HOVER_PROBE_SAMPLES then
+    probe.dropped = probe.dropped + 1
+    return
+  end
+  table.insert(probe.samples, {
+    area = key, reason = reason, x = Round2(x), y = Round2(y),
+    focus = ProbeFocusLabel(focus), map = self.currentMap,
+    width = Round2(width), height = Round2(height),
+  })
+end
+
+-- Chat lines for /pc map hover report: per area, cursor samples inside its
+-- shape, how many showed its hover, and the most frequent miss reasons.
+function Map:HoverProbeReport()
+  local probe = self.hoverProbe
+  if not probe then return { "hover probe is off (/pc map hover probe)" } end
+  local lines = {}
+  for id, stats in pairs(probe.areas) do
+    local reasons = {}
+    for reason, count in pairs(stats.reasons) do
+      table.insert(reasons, { reason, count })
+    end
+    table.sort(reasons, function(a, b) return a[2] > b[2] end)
+    local text = id .. " inside=" .. stats.inside .. " hovered=" .. stats.hovered
+      .. " missed=" .. stats.missed
+    local index = 1
+    while index <= 3 and reasons[index] do
+      text = text .. " " .. reasons[index][1] .. "=" .. reasons[index][2]
+      index = index + 1
+    end
+    table.insert(lines, text)
+  end
+  table.sort(lines)
+  if table.getn(lines) == 0 then
+    table.insert(lines, "no sample inside an area yet (open the map, move the cursor)")
+  end
+  table.insert(lines, "samples kept=" .. table.getn(probe.samples) .. " dropped=" .. probe.dropped
+    .. " (/reload saves them)")
+  return lines
+end
+
 function Map:Tick()
   self:StepBuildQueue()
   local now = PC.Now and PC.Now() or 0
@@ -1507,6 +1876,10 @@ function Map:Tick()
     self.lastHoverAt = now
     local hoverOk, hoverError = pcall(self.UpdateHover, self)
     if not hoverOk and PC.RecordError then PC.RecordError("map hover", hoverError) end
+    if self.hoverProbe then
+      local probeOk, probeError = pcall(self.ProbeHover, self)
+      if not probeOk and PC.RecordError then PC.RecordError("map hover probe", probeError) end
+    end
   end
   if type(now) == "number" and now > 0 then
     if not self.lastRefreshAt or now - self.lastRefreshAt >= REFRESH_INTERVAL then

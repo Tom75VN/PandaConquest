@@ -11,12 +11,16 @@ core\storage.lua
 core\send_queue.lua
 core\version.lua
 data\pois.lua
+data\ui_atlas.lua
+modules\ui_skin.lua
 modules\area_contours.lua
 modules\map.lua
+modules\minimap_areas.lua
 modules\presence.lua
 modules\witness.lua
 modules\progress.lua
 modules\import.lua
+modules\companion.lua
 modules\capture.lua
 modules\hunting.lua
 modules\catchup.lua
@@ -27,6 +31,8 @@ modules\garrison.lua
 modules\scout.lua
 modules\attack.lua
 modules\capture_hud.lua
+modules\main_window_classic.lua
 modules\main_window.lua
 modules\minimap_button.lua
+modules\file_probe.lua
 modules\p2ptest.lua

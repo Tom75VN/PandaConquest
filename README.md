@@ -2,7 +2,7 @@
 
 PandaConquest is an addon for the OctoWoW client (1.12.1, Lua 5.0), dedicated to community PvE achievements.
 
-The goal is to let each player unlock custom achievements, follow their progress, view other users' progress and take part in leaderboards per character or campaign. The addon must work locally without any external service. In-game P2P sharing and optional cloud synchronization can complete this once their constraints are validated.
+The goal is to let each player unlock custom achievements, follow their progress, view other users' progress and take part in leaderboards per character or campaign. The addon must work locally without any external service. In-game P2P sharing and cloud synchronization through the companion complete this.
 
 ## Current state
 
@@ -24,7 +24,7 @@ A first map foundation is also available: POIs can be registered as points or gr
 - The MVP is about PvE, not territorial control or PvP, with one exception: the capture of `OUTPOST`s ([design](docs/capture.md), decision 0012).
 - Each character is a distinct identity: `character@realm`.
 - Offline operation is mandatory.
-- The companion application and the Cloudflare cloud stay optional ([decision 0030](docs/decisions/0030-cloudflare-cloud-baseline.md)).
+- The companion application (Windows; Linux and macOS planned) is required to play the conquest; play itself never waits for the Cloudflare cloud ([decision 0055](docs/decisions/0055-companion-required-all-platforms.md)).
 - The first progress types are monotonic: boolean, increasing counter or tier.
 - P2P or cloud data is no proof from the server.
 - Network capabilities must not be assumed before a reproducible two-client test.
@@ -56,6 +56,8 @@ The expected client uses interface `11200`. After installing or changing the add
 /pc p2p log
 /pc map
 ```
+
+The PandaConquest window opens with `/pc` or the minimap button; `/pc classic` opens the previous text window, kept as a backup.
 
 An accepted send call or an event registered without error does not prove delivery. Validation requires two clients and the [P2P tests](docs/p2p-testing.md) procedure.
 
