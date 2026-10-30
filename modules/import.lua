@@ -18,7 +18,7 @@ PC.Import = Import
 -- schema 1 (no owners) is still accepted.
 -- Schema 3 adds the membership ticket, the revocation list and the faction
 -- history (decision 0061, roadmap WP15).
-local SCHEMA = 3
+local SCHEMA = 4
 local U32 = 4294967296
 local I31 = 2147483648
 local CRC_POLY = 3988292384 -- 0xEDB88320
@@ -30,7 +30,7 @@ local MAX_PROGRESS = 500
 local MAX_ROWS = 100
 local MAX_OWNERS = 512
 local MAX_GENERATION = 1000000
-local OWNER_RANKS = { C = 1, Q = 2, W = 3, D = 4 }
+local OWNER_RANKS = { U = 0, C = 1, Q = 2, W = 3, D = 4 }
 
 Import.SCHEMA = SCHEMA
 
@@ -132,7 +132,20 @@ do
     value = { kind = "record", fields = { d = Int(MAX_DAY), h = Int(MAX_OWNERS), a = Int(MAX_OWNERS) } },
   }
 end
-local SPECS = { [1] = SPEC, [2] = SPEC2, [3] = SPEC3 }
+-- Schema 4 adds saved ownership observations, never capture evidence.
+local SPEC4 = { kind = "record", fields = {} }
+do
+  local key, field
+  for key, field in pairs(SPEC3.fields) do SPEC4.fields[key] = field end
+  SPEC4.fields.owners = {
+    kind = "map", key = ID, max = MAX_OWNERS,
+    value = { kind = "record", fields = {
+      g = Int(MAX_GENERATION), o = Id(1, "^[HA%-]$"),
+      t = Id(1, "^[UCQWD]$"), c = { kind = "char", dash = true },
+    } },
+  }
+end
+local SPECS = { [1] = SPEC, [2] = SPEC2, [3] = SPEC3, [4] = SPEC4 }
 
 local function ValidChar(text)
   if type(text) ~= "string" or string.len(text) > MAX_CHAR or string.find(text, "%c") then return false end
@@ -363,7 +376,8 @@ function Import:Validate(raw)
     for poi, e in pairs(raw.owners) do
       -- An owner and a capturer exactly when the entry is not disputed.
       local disputed = e.t == "Q" or e.t == "D"
-      if e.g < 1 or disputed ~= (e.o == "-") or disputed ~= (e.c == "-") then
+      if e.g < 1 or (e.t == "U" and (e.c ~= "-" or e.g > 1000))
+          or (e.t ~= "U" and (disputed ~= (e.o == "-") or disputed ~= (e.c == "-"))) then
         return nil, "invalid import.owners." .. poi
       end
     end
@@ -421,8 +435,12 @@ local function MergeInto(into, data)
     local poi, entry
     for poi, entry in pairs(data.owners) do
       local old = into.owners[poi]
-      if not old or entry.g > old.g or (entry.g == old.g and OWNER_RANKS[entry.t] > OWNER_RANKS[old.t]) then
+      if not old or (old.t == "U" and entry.t ~= "U")
+          or ((old.t == "U") == (entry.t == "U") and (entry.g > old.g
+          or (entry.g == old.g and OWNER_RANKS[entry.t] > OWNER_RANKS[old.t]))) then
         into.owners[poi] = Copy(entry)
+      elseif old.t == "U" and entry.t == "U" and entry.g == old.g and entry.o ~= old.o then
+        old.o = "-"
       end
     end
   end

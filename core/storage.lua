@@ -84,6 +84,7 @@ function Storage:Initialize()
   -- The build that last wrote this file, read by the companion (decision 0031).
   db.addonVersion = PC.version
   db.channelLevel = PC.channelLevel
+  db.importSchema = PC.Import and PC.Import.SCHEMA or nil
   db.sequence = tonumber(db.sequence) or 0
   db.session = {
     id = MakeSessionId(),

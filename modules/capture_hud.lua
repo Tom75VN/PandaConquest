@@ -35,6 +35,9 @@ local BADGE_WIDTH, BADGE_HEIGHT = 16, 19
 local ICON_SIZE = 14
 -- Resource row icon centers, px from the frame center: players, time to full, wallet.
 local PEOPLE_X, REGEN_X, WALLET_X = -82, -40, 18
+-- Horde and Alliance badge-and-count groups sit in the upper corners; the
+-- optional remaining-time group stays in the content column.
+local HORDE_COUNT_X, ALLIANCE_COUNT_X, COUNT_CLOCK_X = 76, -103, 0
 local TOGGLE_SIZE = 16
 local TOGGLE_INSET = 2
 -- The title leaves room for the toggle on its right (and the same on its left).
@@ -188,6 +191,21 @@ function HUD:Build()
     self.resourceWallet:SetPoint("LEFT", self.resourceWalletIcon, "RIGHT", 2, 0)
     self.resourceWallet:SetWidth(82)
     if self.resourceWallet.SetJustifyH then self.resourceWallet:SetJustifyH("LEFT") end
+    self.countHIcon = skin:Icon(frame, "badge.horde", BADGE_WIDTH, BADGE_HEIGHT, "OVERLAY")
+    self.countH = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    self.countH:SetPoint("LEFT", self.countHIcon, "RIGHT", 2, 0)
+    self.countH:SetWidth(18)
+    if self.countH.SetJustifyH then self.countH:SetJustifyH("LEFT") end
+    self.countAIcon = skin:Icon(frame, "badge.alliance", BADGE_WIDTH, BADGE_HEIGHT, "OVERLAY")
+    self.countA = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    self.countA:SetPoint("LEFT", self.countAIcon, "RIGHT", 2, 0)
+    self.countA:SetWidth(18)
+    if self.countA.SetJustifyH then self.countA:SetJustifyH("LEFT") end
+    self.countClockIcon = skin:Icon(frame, "icon.clock", ICON_SIZE, ICON_SIZE, "OVERLAY")
+    self.countClock = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    self.countClock:SetPoint("LEFT", self.countClockIcon, "RIGHT", 2, 0)
+    self.countClock:SetWidth(36)
+    if self.countClock.SetJustifyH then self.countClock:SetJustifyH("LEFT") end
   end
 
   -- The red warning line at the bottom, plain text: refusal reasons and the
@@ -371,6 +389,7 @@ function HUD:Layout()
     y = y + height + LINE_GAP
   end
   local resourceRow = self.resourceStateIcon and self.resourceStateIcon:IsShown()
+  local countRow = self.countHIcon and self.countHIcon:IsShown()
   local list = { self.title, self.mode, self.info, self.detail, self.warning, self.medal }
   local index = 1
   if collapsed then
@@ -386,9 +405,23 @@ function HUD:Layout()
       self.resourceWalletIcon:Hide()
       self.resourceWallet:Hide()
     end
+    if self.countHIcon then
+      self.countHIcon:Hide()
+      self.countH:Hide()
+      self.countAIcon:Hide()
+      self.countA:Hide()
+      self.countClockIcon:Hide()
+      self.countClock:Hide()
+    end
   else
     self.title:Show()
     self.detail:Show()
+    if countRow then
+      self.countHIcon:ClearAllPoints()
+      self.countHIcon:SetPoint("TOP", frame, "TOP", HORDE_COUNT_X, -PAD)
+      self.countAIcon:ClearAllPoints()
+      self.countAIcon:SetPoint("TOP", frame, "TOP", ALLIANCE_COUNT_X, -PAD)
+    end
     if HasText(self.title) then Place(self.title, TextHeight(self.title)) end
     if resourceRow then
       self.resourceStateIcon:ClearAllPoints()
@@ -400,7 +433,13 @@ function HUD:Layout()
       y = y + ICON_SIZE + LINE_GAP
     end
     if HasText(self.mode) then Place(self.mode, TextHeight(self.mode)) end
-    if HasText(self.info) then Place(self.info, TextHeight(self.info)) end
+    if countRow and self.countClockIcon:IsShown() then
+      self.countClockIcon:ClearAllPoints()
+      self.countClockIcon:SetPoint("TOP", frame, "TOP", COUNT_CLOCK_X, -y - 2)
+      y = y + ICON_SIZE + LINE_GAP
+    elseif HasText(self.info) then
+      Place(self.info, TextHeight(self.info))
+    end
   end
   Place(self.bar, BAR_HEIGHT)
   if not collapsed then
@@ -602,6 +641,14 @@ function HUD:Update()
     self.resourceWalletIcon:Hide()
     self.resourceWallet:Hide()
   end
+  if self.countHIcon then
+    self.countHIcon:Hide()
+    self.countH:Hide()
+    self.countAIcon:Hide()
+    self.countA:Hide()
+    self.countClockIcon:Hide()
+    self.countClock:Hide()
+  end
 
   if data.resource then
     -- A resource POI is never captured: its shared stock is the main visual.
@@ -661,7 +708,7 @@ function HUD:Update()
 
   local view = data.view
   local owner = view and view.owner or Capture:GetOwner(data.id)
-  self.title:SetText(AreaName(data.area) .. " - " .. FactionName(owner))
+  self.title:SetText(AreaName(data.area))
   SetPOICrest(self.medal, data.area)
 
   if data.hunting then
@@ -684,10 +731,27 @@ function HUD:Update()
     if view.challenger ~= "-" then
       percent = " - " .. FactionName(view.challenger) .. " " .. math.floor(view.progress / 10) .. "%"
     end
-    self.mode:SetText(Capture:ModeText(view) .. percent)
-    local info = "Horde " .. view.nH .. "  Alliance " .. view.nA
-    if data.remaining then info = info .. "  -  " .. Clock(data.remaining) end
-    self.info:SetText(info)
+    local mode = Capture:ModeText(view)
+    if mode == "Controlled by " .. FactionName(owner) then mode = "" end
+    self.mode:SetText(mode .. percent)
+    if self.countHIcon then
+      self.info:SetText("")
+      self.countH:SetText(tostring(view.nH))
+      self.countHIcon:Show()
+      self.countH:Show()
+      self.countA:SetText(tostring(view.nA))
+      self.countAIcon:Show()
+      self.countA:Show()
+      if data.remaining then
+        self.countClock:SetText(Clock(data.remaining))
+        self.countClockIcon:Show()
+        self.countClock:Show()
+      end
+    else
+      local info = "Horde " .. view.nH .. "  Alliance " .. view.nA
+      if data.remaining then info = info .. "  -  " .. Clock(data.remaining) end
+      self.info:SetText(info)
+    end
   else
     self:SetShares(owner == "H" and 1 or 0, owner == "A" and 1 or 0)
     self.mode:SetText("Waiting for the outpost state...")

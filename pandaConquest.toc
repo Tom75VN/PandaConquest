@@ -2,7 +2,7 @@
 ## Title: |cffffffffPanda |cfff5ae0aConquest|r
 ## Notes: Community PvE achievements, P2P diagnostics, and shared map POIs.
 ## Author: PandaConquest contributors
-## Version: 0.0.1
+## Version: 0.1.0
 ## SavedVariables: PandaConquestDB
 ## SavedVariablesPerCharacter: PandaConquestImport
 
@@ -39,3 +39,4 @@ modules\main_window.lua
 modules\minimap_button.lua
 modules\file_probe.lua
 modules\p2ptest.lua
+modules\alpha_channel.lua

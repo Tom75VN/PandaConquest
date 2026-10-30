@@ -27,9 +27,9 @@ local COLORS = {
 }
 local RESOURCE_NAMES = { gold = "Gold", wood = "Wood", food = "Food" }
 local SOURCE_LABELS = {
-  LOCAL = "seen by you",
-  PEER = "reported by players, unverified",
-  STATIC = "no capture known",
+  LOCAL = "confirmed",
+  PEER = "reported",
+  STATIC = "not captured yet",
 }
 local TERRITORY_TYPES = { OUTPOST = true, HUNTING_GROUNDS = true, SETTLEMENT = true }
 
@@ -205,7 +205,7 @@ function Window.TerritoryRows(now)
       if info and info.cloud then
         local cloudLabel, code, detail = capture.CloudLine(info.cloud)
         Row(list, "    " .. Paint("DIM", cloudLabel .. ": ") .. (code and FactionText(code) or "")
-          .. Paint("DIM", (code and ", " or "") .. detail))
+          .. Paint("DIM", (code and detail and ", " or "") .. (detail or "")))
       end
       if info and info.challenger then
         local text = "    Capture by " .. FactionText(info.challenger) .. " " .. info.percent .. "%"
@@ -260,10 +260,10 @@ function Window.SyncRows(rows, now)
     Row(rows, "  Addon version", tostring(PC.version) .. Paint("DIM", ", no newer version seen"))
   end
   Header(rows, "What the labels mean")
-  Row(rows, "  " .. Paint("DIM", "seen by you: your own client watched it happen"))
-  Row(rows, "  " .. Paint("DIM", "reported by players, unverified: told on the channel, never checked"))
-  Row(rows, "  " .. Paint("DIM", "Unconfirmed: some players claim another owner"))
-  Row(rows, "  " .. Paint("DIM", "not observed: no stock seen since login, assumed full"))
+  Row(rows, "  " .. Paint("DIM", "confirmed: your own client watched it happen"))
+  Row(rows, "  " .. Paint("DIM", "reported: told on the channel, never checked"))
+  Row(rows, "  " .. Paint("DIM", "unconfirmed: some players claim another owner"))
+  Row(rows, "  " .. Paint("DIM", "not captured yet: no capture seen since login"))
 end
 
 -- The Garrison tab only opens while the player stands in an Outpost or a
@@ -689,9 +689,9 @@ function Window.GuideRows(now)
   Row(rows, "  Hold every Outpost and Hunting Grounds of its zone, empty its garrison and scout it.")
   Row(rows, "  " .. Paint("DIM", "Then " .. capture.SIEGE_ATTACKERS .. " players stand inside for "
     .. math.floor(capture.SETTLEMENT_DURATION / 60) .. " minutes. The War tab shows what is missing."))
-  Header(rows, "Shared, not verified")
-  Row(rows, "  Players online share everything on the PandaConquest channel; no server checks it.")
-  Row(rows, "  " .. Paint("DIM", "The Territory tab shows where each piece of data comes from and the channel health."))
+  Header(rows, "A living world")
+  Row(rows, "  The war moves as players play: captures, armies and stocks change all the time.")
+  Row(rows, "  " .. Paint("DIM", "Some news can arrive late. The Territory tab shows how fresh it is."))
   return rows
 end
 
@@ -981,9 +981,9 @@ function Window:Toggle()
   return true
 end
 
+Window:AddTab("map", "Territory", Window.TerritoryRows)
 Window:AddTab("res", "Resources", Window.ResourceRows)
 Window:AddTab("army", "Army", Window.ArmyRows)
-Window:AddTab("map", "Territory", Window.TerritoryRows)
 Window:AddTab("garrison", "Garrison", Window.GarrisonRows, Window.InGarrison)
 Window:AddTab("war", "War", Window.WarRows)
 Window:AddTab("guide", "Guide", Window.GuideRows)

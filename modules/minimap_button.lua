@@ -6,13 +6,16 @@ local Button = {}
 PC.MinimapButton = Button
 
 -- Minimap button opening the main window (modules/main_window.lua). Dragged
--- around the minimap edge; its angle in degrees is saved in
+-- around the minimap edge (circle or square, following PandaUI's setting);
+-- its angle in degrees is saved in
 -- PandaConquestDB.settings.minimapAngle. The 1.12 globals cos, sin and atan2
 -- work in degrees.
 local NAME = "PandaConquestMinimapButton"
 local DEFAULT_ANGLE = 200
 local RADIUS = 80
-local SIZE = 32
+local FRAME_SIZE = 33
+local ICON_SIZE = 24
+local HIGHLIGHT = "Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight"
 
 Button.DEFAULT_ANGLE = DEFAULT_ANGLE
 
@@ -37,6 +40,23 @@ function Button:Angle()
   return angle
 end
 
+-- PandaUI owns the optional circle/square minimap setting; the standard
+-- GetMinimapShape() hook of other minimap addons is the fallback. Anything
+-- unknown stays round.
+function Button:IsSquare()
+  local pandaUI = GetGlobal("PandaUI")
+  if type(pandaUI) == "table" and type(pandaUI.MinimapIsSquare) == "function" then
+    local ok, square = pcall(pandaUI.MinimapIsSquare)
+    if ok then return square == true end
+  end
+  local shape = GetGlobal("GetMinimapShape")
+  if type(shape) == "function" then
+    local ok, name = pcall(shape)
+    return ok and name == "SQUARE"
+  end
+  return false
+end
+
 function Button:Place(angle)
   local frame, minimap = self.frame, GetGlobal("Minimap")
   local cos, sin = GetGlobal("cos"), GetGlobal("sin")
@@ -46,7 +66,23 @@ function Button:Place(angle)
     frame:SetPoint("CENTER", minimap, "BOTTOMLEFT", 0, 0)
     return
   end
-  frame:SetPoint("CENTER", minimap, "CENTER", RADIUS * cos(angle), RADIUS * sin(angle))
+  local c, s = cos(angle), sin(angle)
+  local reach = RADIUS
+  self.square = self:IsSquare()
+  if self.square then
+    -- Ride the square edge: scale the direction until its larger axis reaches it.
+    local longest = math.max(math.abs(c), math.abs(s))
+    if longest > 0 then reach = RADIUS / longest end
+  end
+  frame:SetPoint("CENTER", minimap, "CENTER", reach * c, reach * s)
+end
+
+-- The circle/square setting can change while playing: re-place on a change.
+local function OnShapeWatch()
+  Button.shapeElapsed = (Button.shapeElapsed or 0) + (arg1 or 0)
+  if Button.shapeElapsed < 1 then return end
+  Button.shapeElapsed = 0
+  if Button.frame and Button:IsSquare() ~= Button.square then Button:Place(Button:Angle()) end
 end
 
 -- Angle of the cursor around the minimap centre, in [0, 360).
@@ -89,23 +125,21 @@ function Button:Build()
   local ok, frame = pcall(create, "Button", NAME, minimap)
   if not ok or not frame then return nil end
   self.frame = frame
-  frame:SetWidth(SIZE)
-  frame:SetHeight(SIZE)
+  frame:SetWidth(FRAME_SIZE)
+  frame:SetHeight(FRAME_SIZE)
   frame:SetFrameStrata("MEDIUM")
   frame:SetFrameLevel(minimap:GetFrameLevel() + 8)
 
-  -- The gold ring with the panda emblem; pushed while held, a glow on mouse-over.
+  -- The crossed-swords emblem; pushed while held, native blue highlight on hover.
   local skin = PC.Skin
   local icon = frame:CreateTexture(nil, "ARTWORK")
-  icon:SetWidth(SIZE)
-  icon:SetHeight(SIZE)
+  icon:SetWidth(ICON_SIZE)
+  icon:SetHeight(ICON_SIZE)
   icon:SetPoint("CENTER", frame, "CENTER", 0, 0)
   if skin then
     skin:Apply(icon, "minimap.normal")
-    local glow = skin:Icon(frame, "minimap.hover", SIZE + 6, SIZE + 6, "HIGHLIGHT")
-    glow:SetPoint("CENTER", frame, "CENTER", 0, 0)
-    glow:SetBlendMode("ADD")
   end
+  frame:SetHighlightTexture(HIGHLIGHT)
   self.icon = icon
 
   frame:RegisterForClicks("LeftButtonUp")
@@ -127,6 +161,11 @@ function Button:Build()
     if tooltip then tooltip:Hide() end
   end)
   self:Place(self:Angle())
+  local watcher = create("Frame", NAME .. "ShapeWatch", frame)
+  if watcher then
+    watcher:SetScript("OnUpdate", OnShapeWatch)
+    self.watcher = watcher
+  end
   return frame
 end
 

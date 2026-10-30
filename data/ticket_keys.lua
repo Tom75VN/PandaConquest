@@ -8,5 +8,6 @@ PandaConquest = PandaConquest or {}
 PandaConquest.TicketKeys = {
   schema = 1,
   keys = {
+    ["1"] = "fb229a9492b1366123693afe15f3eef957be1b0a4eb9a1e903dfc3d36d89da37",
   },
 }

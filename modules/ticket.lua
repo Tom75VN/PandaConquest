@@ -146,32 +146,58 @@ end
 
 local worker
 local frame
+local Co
+local requestAfterWorker
+if type(coroutine) == "table" and type(coroutine.create) == "function"
+    and type(coroutine.resume) == "function" and type(coroutine.status) == "function"
+    and type(coroutine.yield) == "function" then
+  Co = coroutine
+end
 
 local function Pause()
-  if Ticket.sliceStart and Clock() - Ticket.sliceStart > BUDGET_MS then coroutine.yield() end
+  if Ticket.sliceStart and Clock() - Ticket.sliceStart > BUDGET_MS then Co.yield() end
+end
+
+local function VerifyJob(job, pause)
+  local ok, valid = pcall(PC.Ed25519.Verify, job.key, job.text, job.sig, pause)
+  job.done(ok and valid == true, not ok and tostring(valid) or nil)
 end
 
 local function Work()
   while true do
     local job = table.remove(Ticket.queue, 1)
     if not job then return end
-    local ok, valid = pcall(PC.Ed25519.Verify, job.key, job.text, job.sig, Pause)
-    job.done(ok and valid == true, not ok and tostring(valid) or nil)
+    VerifyJob(job, Pause)
   end
 end
 
 local function OnUpdate()
-  if not worker or coroutine.status(worker) == "dead" then
+  if not Co then
+    local job = table.remove(Ticket.queue, 1)
+    if not job then
+      if frame then frame:SetScript("OnUpdate", nil) end
+      return
+    end
+    local ok, err = pcall(VerifyJob, job)
+    if not ok and PC.RecordError then PC.RecordError("ticket verification", err) end
+    if table.getn(Ticket.queue) == 0 and frame then frame:SetScript("OnUpdate", nil) end
+    return
+  end
+  if not worker or Co.status(worker) == "dead" then
     if table.getn(Ticket.queue) == 0 then
       if frame then frame:SetScript("OnUpdate", nil) end
       worker = nil
       return
     end
-    worker = coroutine.create(Work)
+    worker = Co.create(Work)
   end
   Ticket.sliceStart = Clock()
-  local ok, err = coroutine.resume(worker)
+  local ok, err = Co.resume(worker)
   Ticket.sliceStart = nil
+  if requestAfterWorker then
+    requestAfterWorker = nil
+    Ticket:RequestIfNeeded()
+  end
   if not ok then
     worker = nil
     if PC.RecordError then PC.RecordError("ticket verification", err) end
@@ -253,7 +279,9 @@ function Ticket:OnImport(data)
     Ticket.own.status = valid and "VALID" or "INVALID"
     Record("TICKET_OWN", { status = Ticket.own.status, from = t.a, to = t.b })
     if valid and Ticket.joined then Ticket:Announce() end
-    if not valid then Ticket:RequestIfNeeded() end
+    if not valid then
+      if Ticket.sliceStart then requestAfterWorker = true else Ticket:RequestIfNeeded() end
+    end
   end)
 end
 

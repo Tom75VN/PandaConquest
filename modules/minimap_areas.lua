@@ -5,7 +5,7 @@ local Map = PC.Map
 
 -- POI areas of the player's zone on the minimap (docs/map-pois.md § Minimap,
 -- decision 0054): the world map's records and colours, placed around the
--- player and clipped to the round minimap. Local display only.
+-- player and clipped to the active minimap shape. Local display only.
 local MinimapAreas = {
   patches = {},
   icons = {},
@@ -65,6 +65,15 @@ local function ReadIndoor(zoom)
   return zoom == inside
 end
 
+-- PandaUI owns the optional circle/square setting
+-- (minimap.modernwow_circle_square_option_unverified). Missing PandaUI keeps round clipping.
+local function SquareMinimap()
+  local pandaUI = PandaUI
+  if type(pandaUI) ~= "table" or type(pandaUI.MinimapIsSquare) ~= "function" then return false end
+  local ok, square = pcall(pandaUI.MinimapIsSquare)
+  return ok and square == true
+end
+
 local function Hide(object)
   if object and type(object.Hide) == "function" then object:Hide() end
 end
@@ -122,16 +131,23 @@ local function Draw(self, left, top, right, bottom, u1, u2, color)
   texture:Show()
 end
 
--- A record fully inside the circle is drawn as is; one crossing the edge is
--- cut into bands, each clipped to the circle's chord at its middle, the
--- profile coordinate following the clipped ends.
+-- Round minimaps use chord-clipped bands; square minimaps clip directly to
+-- their visible rectangle.
 local function PlaceRecord(self, record, view, color)
   local left = (record[1] - view.x) * view.width
   local right = (record[3] - view.x) * view.width
   local top = (record[2] - view.y) * view.height
   local bottom = (record[4] - view.y) * view.height
+  local halfWidth, halfHeight = view.halfWidth, view.halfHeight
+  if right <= -halfWidth or left >= halfWidth or bottom <= -halfHeight or top >= halfHeight then return end
+  if view.square then
+    local l, r = math.max(left, -halfWidth), math.min(right, halfWidth)
+    local slope = (record[6] - record[5]) / (right - left)
+    Draw(self, l, math.max(top, -halfHeight), r, math.min(bottom, halfHeight),
+      record[5] + slope * (l - left), record[5] + slope * (r - left), color)
+    return
+  end
   local radius = view.radius
-  if right <= -radius or left >= radius or bottom <= -radius or top >= radius then return end
   local farX = math.max(math.abs(left), math.abs(right))
   local farY = math.max(math.abs(top), math.abs(bottom))
   if farX * farX + farY * farY <= radius * radius then
@@ -160,7 +176,9 @@ local function PlaceIcon(self, area, view)
   if not x then return end
   local dx, dy = (x - view.x) * view.width, (y - view.y) * view.height
   local reach = view.radius - ICON_SIZE / 2
-  if reach <= 0 or dx * dx + dy * dy > reach * reach then return end
+  if view.square then
+    if math.abs(dx) > view.halfWidth - ICON_SIZE / 2 or math.abs(dy) > view.halfHeight - ICON_SIZE / 2 then return end
+  elseif reach <= 0 or dx * dx + dy * dy > reach * reach then return end
   self.iconsUsed = self.iconsUsed + 1
   local index = self.iconsUsed
   local icon = self.icons[index]
@@ -275,7 +293,8 @@ function MinimapAreas:Tick(elapsed)
   self.sinceLayout = self.sinceLayout + self.elapsed
   self.elapsed = 0
   local minimap = self.minimap
-  if not Map.enabled or Map:Locked() or not minimap then
+  -- The world map checkbox (Map:Hidden) hides the minimap areas too.
+  if not Map.enabled or Map:Locked() or Map:Hidden() or not minimap then
     self:Clear()
     return
   end
@@ -297,26 +316,29 @@ function MinimapAreas:Tick(elapsed)
     self.indoorDirty = false
   end
   local yards = (self.indoor and INDOOR_YARDS or OUTDOOR_YARDS)[zoom + 1]
-  local size = minimap:GetWidth()
-  if not zone or not yards or type(size) ~= "number" or size <= 0 then
+  local size, height = minimap:GetWidth(), minimap:GetHeight()
+  if not zone or not yards or type(size) ~= "number" or size <= 0 or type(height) ~= "number" or height <= 0 then
     self:Clear()
     return
   end
+  local square = SquareMinimap()
 
   local scale = size / yards
-  local width, height = (zone[1] - zone[2]) * scale, (zone[3] - zone[4]) * scale
+  local width, mapHeight = (zone[1] - zone[2]) * scale, (zone[3] - zone[4]) * scale
   local moved = self.lastX and math.max(math.abs(x - self.lastX) * width,
-    math.abs(y - self.lastY) * height) or MOVE_PIXELS
-  if self.mapKey == self.fileKey and zoom == self.zoom and size == self.size
+    math.abs(y - self.lastY) * mapHeight) or MOVE_PIXELS
+  if self.mapKey == self.fileKey and zoom == self.zoom and size == self.size and height == self.height and square == self.square
       and moved < MOVE_PIXELS and not self.pending and self.revision == Map.revision
       and self.sinceLayout < REFRESH_INTERVAL then
     return
   end
 
-  self.mapKey, self.zoom, self.size, self.revision = self.fileKey, zoom, size, Map.revision
+  self.mapKey, self.zoom, self.size, self.height, self.square, self.revision = self.fileKey, zoom, size, height, square, Map.revision
   self.lastX, self.lastY, self.sinceLayout = x, y, 0
   view.mapKey, view.x, view.y = self.fileKey, x, y
-  view.width, view.height, view.radius = width, height, size / 2 - EDGE_INSET
+  view.width, view.height = width, mapHeight
+  view.halfWidth, view.halfHeight = size / 2 - EDGE_INSET, height / 2 - EDGE_INSET
+  view.radius, view.square = math.min(view.halfWidth, view.halfHeight), square
   self:Layout(view)
 end
 

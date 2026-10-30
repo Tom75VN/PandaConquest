@@ -352,12 +352,12 @@ function Skin:Balance(parent, width, height)
   bar:SetHeight(height)
   local cap = height * 1.25
   local track = create("Frame", nil, bar)
-  track:SetPoint("TOPLEFT", bar, "TOPLEFT", cap * 0.7, -height * 0.15)
-  track:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", -cap * 0.7, height * 0.15)
+  track:SetPoint("TOPLEFT", bar, "TOPLEFT", cap * 0.8, -height * 0.15)
+  track:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", -cap * 0.8, height * 0.15)
   local trackHeight = height * 0.7
   self:Slice3(track, "balance.frame", trackHeight, "BORDER")
   bar.track = track
-  bar.inner = width - 2 * cap * 0.7 - trackHeight * 0.5
+  bar.inner = width - 2 * cap * 0.8 - trackHeight * 0.5
   local inset = trackHeight * 0.22
   bar.blue = track:CreateTexture(nil, "ARTWORK")
   self:Apply(bar.blue, "fill.blue")
@@ -369,18 +369,25 @@ function Skin:Balance(parent, width, height)
   bar.red:SetHeight(trackHeight - 2 * inset)
   local left = self:Icon(bar, "balance.left", cap, cap, "OVERLAY")
   left:SetPoint("LEFT", bar, "LEFT", 0, 0)
-  local crest = self:Icon(bar, "crest.alliance", cap * 0.62, cap * 0.62, "OVERLAY")
-  crest:SetPoint("CENTER", left, "CENTER", -cap * 0.06, 0)
   local right = self:Icon(bar, "balance.right", cap, cap, "OVERLAY")
   right:SetPoint("RIGHT", bar, "RIGHT", 0, 0)
-  crest = self:Icon(bar, "crest.horde", cap * 0.62, cap * 0.62, "OVERLAY")
-  crest:SetPoint("CENTER", right, "CENTER", cap * 0.06, 0)
   local marker = create("Frame", nil, bar)
-  marker:SetWidth(height)
-  marker:SetHeight(height)
+  local sword = height * 0.7
+  marker:SetWidth(sword)
+  marker:SetHeight(sword)
   marker:SetFrameLevel((bar:GetFrameLevel() or 0) + 2)
-  self:Icon(marker, "crest.swords", height, height, "OVERLAY"):SetPoint("CENTER", marker, "CENTER", 0, 0)
+  self:Icon(marker, "crest.swords", sword, sword, "OVERLAY"):SetPoint("CENTER", marker, "CENTER", 0, 0)
   bar.marker = marker
+  -- Faction crests sit in their own frame above the swords marker so the
+  -- swords never hide them at either end.
+  local crests = create("Frame", nil, bar)
+  crests:SetAllPoints(bar)
+  crests:SetFrameLevel((bar:GetFrameLevel() or 0) + 4)
+  local size = cap * 1.0
+  local crest = self:Icon(crests, "crest.alliance", size, size, "OVERLAY")
+  crest:SetPoint("CENTER", left, "CENTER", -cap * 0.04, 0)
+  crest = self:Icon(crests, "crest.horde", size, size, "OVERLAY")
+  crest:SetPoint("CENTER", right, "CENTER", cap * 0.04, 0)
   self:SetBalance(bar, 1, 1)
   return bar
 end

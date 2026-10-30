@@ -101,7 +101,7 @@ local HINT_JUMP = 10
 -- Generation floor (decision 0060): values this close to the wire bound (1,000,000)
 -- are ignored, so a forged generation can never make the next capture unrepresentable.
 local FLOOR_MAX = 990000
-local CLOUD_RANKS = { C = 1, Q = 2, W = 3, D = 4 }
+local CLOUD_RANKS = { U = 0, C = 1, Q = 2, W = 3, D = 4 }
 -- Rule R14 with two answers: a pending reply waits for two matching answers
 -- from distinct senders, or four of any kind, before it is dropped.
 local REPLY_MATCHES = 2
@@ -427,19 +427,35 @@ function Capture:AttemptDuration(id)
   return Capture.DefenseDuration((self:GarrisonDefense(id)))
 end
 
--- The Settlement prerequisites for faction side (decision 0053), in the order
--- SiegeBlocked checks them: every linked objective held by side, an empty
+-- Owner used only by the linked-objective gate of a Settlement siege. During
+-- testing and launch, a newer unconfirmed P2P or companion owner is accepted
+-- without entering the confirmed registry (decision 0062).
+function Capture:SiegeOwner(id, now)
+  local owner = self:GetOwner(id)
+  local hint = self:BestHint(id, now or Now())
+  local cloud = self:CloudHint(id)
+  if cloud and cloud.o and (not hint or cloud.g > hint.generation) then
+    return cloud.o, false
+  end
+  if hint then return hint.owner, false end
+  return owner, true
+end
+
+-- The Settlement prerequisites for faction side (decisions 0053 and 0062), in the order
+-- SiegeBlocked checks them: every linked objective held or provisionally reported by side, an empty
 -- garrison and, when the other faction holds it, a valid discovery by side.
 -- Each item { ok, text, why }: why is the refusal when ok is false. The two
 -- attackers are counted by SiegeMode. A local reading only (gameplay UI).
 function Capture:SiegeChecklist(id, side, now)
   local list = {}
   local links = self:LinkedObjectives(id)
-  local held, missing = 0, nil
+  local held, provisional, missing = 0, 0, nil
   local index = 1
   while index <= table.getn(links) do
-    if self:GetOwner(links[index]) == side then
+    local objectiveOwner, confirmed = self:SiegeOwner(links[index], now)
+    if objectiveOwner == side then
       held = held + 1
+      if not confirmed then provisional = provisional + 1 end
     elseif not missing then
       missing = links[index]
     end
@@ -449,8 +465,10 @@ function Capture:SiegeChecklist(id, side, now)
   if missing then
     why = (PC.Map.areas[missing].label or missing) .. " is not held by the " .. FACTION_NAMES[side]
   end
+  local accepted = provisional > 0 and (", " .. provisional .. " unconfirmed accepted") or ""
   table.insert(list, { ok = not missing, why = why,
-    text = "Every Outpost and Hunting Grounds of the zone held (" .. held .. "/" .. table.getn(links) .. ")" })
+    text = "Every Outpost and Hunting Grounds of the zone held (" .. held .. "/" .. table.getn(links)
+      .. accepted .. ")" })
   local _, units = self:GarrisonDefense(id)
   table.insert(list, { ok = units == 0, text = "Garrison emptied",
     why = units > 0 and ("its garrison still has " .. units .. " defender(s)") or nil })
@@ -498,10 +516,11 @@ end
 -- speed, a non-zero tie freezes, an empty area returns.
 function Capture:SiegeMode(id, st, nH, nA, now)
   local counts = { H = nH, A = nA }
+  local required = st.owner == "N" and 1 or SIEGE_ATTACKERS
   if st.challenger == "-" then
     local side = nil
     if nH > nA then side = "H" elseif nA > nH then side = "A" end
-    if side and side ~= st.owner and counts[side] >= SIEGE_ATTACKERS
+    if side and side ~= st.owner and counts[side] >= required
         and not self:SiegeBlocked(id, side, now) then
       return "P", side
     end
@@ -512,7 +531,7 @@ function Capture:SiegeMode(id, st, nH, nA, now)
   local defender = attacker == "H" and "A" or "H"
   local a, d = counts[attacker], counts[defender]
   if a > d then
-    if a >= SIEGE_ATTACKERS then return "P", attacker end
+    if a >= required then return "P", attacker end
     return "C", "-"
   end
   if d > a then return "P", defender end
@@ -894,6 +913,7 @@ function Capture:CloudHint(id)
   local entry = self.cloud[id]
   if not entry then return nil end
   local _, generation = self:GetOwner(id)
+  if entry.t == "U" and generation > 0 then return nil end
   if entry.g <= generation then return nil end
   return entry
 end
@@ -906,7 +926,7 @@ function Capture:Floor(id, current)
   local best = registry
   if type(current) == "number" and current > best then best = current end
   local entry = self.cloud[id]
-  if entry and entry.g > best and entry.g <= FLOOR_MAX then best = entry.g end
+  if entry and entry.t ~= "U" and entry.g > best and entry.g <= FLOOR_MAX then best = entry.g end
   local list = self.hints[id]
   if list then
     local index = 1
@@ -921,12 +941,13 @@ end
 
 -- Display of a cloud entry: label, owner code (nil when disputed), detail.
 function Capture.CloudLine(entry)
-  if entry.t == "W" then return "Unconfirmed", entry.o, "cloud, seen by 3+ players" end
+  if entry.t == "U" and entry.o then return "Unconfirmed owner", entry.o, nil end
+  if entry.t == "W" then return "Unconfirmed owner", entry.o, "seen by 3+ players" end
   if entry.t == "C" then
     local name = string.gsub(entry.c or "?", "@.*$", "")
-    return "Claimed", entry.o, "by " .. name .. ", not verified"
+    return "Unconfirmed owner", entry.o, "claimed by " .. name
   end
-  return "Disputed", nil, "cloud reports disagree"
+  return "Unconfirmed owner", nil, "Reports disagree"
 end
 
 function Capture:NextGeneration(id, current)
@@ -2086,13 +2107,18 @@ function Capture:Detail(id, view, side, now)
   local area = self:Outpost(id)
   if not area or not view then return nil end
   if area.type == "SETTLEMENT" then
+    local required = view.owner == "N" and 1 or SIEGE_ATTACKERS
     if view.challenger ~= "-" then
-      return "Siege: " .. Clock(view.dur or SETTLEMENT_DURATION) .. " for a full bar, 2 attackers needed to advance"
+      local attackers = required == 1 and "1 attacker" or required .. " attackers"
+      return "Siege: " .. Clock(view.dur or SETTLEMENT_DURATION) .. " for a full bar, " .. attackers .. " needed to advance"
     end
     if not FACTION_KEYS[side or ""] or side == view.owner then return nil end
     local blocked = self:SiegeBlocked(id, side, now or Now())
     if blocked then return "Siege locked: " .. blocked end
-    return "Siege open: " .. SIEGE_ATTACKERS .. " " .. FACTION_NAMES[side] .. " attackers inside start it"
+    if required == 1 then return "Siege open: 1 " .. FACTION_NAMES[side] .. " attacker inside starts it" end
+    local inside = (side == "H" and view.nH or view.nA) or 0
+    if inside > SIEGE_ATTACKERS then inside = SIEGE_ATTACKERS end
+    return FACTION_NAMES[side] .. " siege: " .. inside .. "/" .. SIEGE_ATTACKERS .. " attackers inside"
   end
   if view.challenger ~= "-" then
     return "Capture time " .. Clock(view.dur or CAPTURE_DURATION) .. ", set by the garrison when the attempt began"

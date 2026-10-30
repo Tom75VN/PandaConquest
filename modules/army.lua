@@ -169,7 +169,7 @@ function Army:Place()
   end
   local area = PC.Presence and PC.Presence.current
   if not area or not PLACE_NAMES[area.type] then
-    return nil, "go inside an Outpost or Settlement of your faction, or your Barracks"
+    return nil, "go inside a friendly Outpost or Settlement"
   end
   local owner
   if area.type == "BARRACKS" then

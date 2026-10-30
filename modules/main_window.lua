@@ -37,10 +37,16 @@ local RESOURCE_NAMES = { gold = "Gold", wood = "Wood", food = "Food" }
 local RESOURCE_FILLS = { gold = "gold", wood = "brown", food = "red" }
 local TERRITORY_TYPES = { OUTPOST = true, HUNTING_GROUNDS = true, SETTLEMENT = true }
 local SOURCE_DOTS = { LOCAL = "dot.green", PEER = "dot.yellow" }
+local SOURCE_TIPS = {
+  LOCAL = { "Confirmed", "You saw this owner yourself." },
+  PEER = { "Reported", "Captured while you were not there. You did not see it yourself." },
+  UNCONFIRMED = { "Unconfirmed", "Some players claim this owner, but nobody has confirmed it." },
+  STATIC = { "Not captured yet", "Nobody has captured this place since you logged in." },
+}
 local SOURCE_LABELS = {
-  LOCAL = "Seen by you",
-  PEER = "Reported by players",
-  STATIC = "No capture known",
+  LOCAL = "Confirmed",
+  PEER = "Reported",
+  STATIC = "Not captured yet",
 }
 local UNIT_ICON_DIR = "Interface\\AddOns\\pandaConquest\\media\\Textures\\Icons\\War3Units\\"
 local UNIT_ICONS = {
@@ -407,9 +413,9 @@ function Army:Build()
   self.sizeBar = Skin():Bar(panel, 170, 12, "gold")
   Place(self.sizeBar, panel, 48, -44)
   self.placeIcon = Skin():Icon(panel, nil, 34, 34)
-  Place(self.placeIcon, panel, 236, -26)
-  self.place = NewText(panel, "GameFontHighlightSmall", 274, -26, 170)
-  self.placeName = NewText(panel, "GameFontHighlightSmall", 274, -42, 170)
+  Place(self.placeIcon, panel, 226, -26)
+  self.place = NewText(panel, "GameFontHighlightSmall", 238, -26, 208)
+  self.placeName = NewText(panel, "GameFontHighlightSmall", 238, -42, 208)
   self.wallet = {}
   local index = 1
   while index <= 3 do
@@ -446,9 +452,9 @@ function Army:Build()
     row.info = NewText(row, "GameFontHighlightSmall", 392, -14, 120)
     row.info2 = NewText(row, "GameFontHighlightSmall", 392, -32, 120)
     row.one = NewButton(row, "dark", 34, 26, "+1")
-    Place(row.one, row, 518, -18)
+    Place(row.one, row, 512, -18)
     row.five = NewButton(row, "dark", 34, 26, "+5")
-    Place(row.five, row, 556, -18)
+    Place(row.five, row, 550, -18)
     self.units[index] = row
     index = index + 1
   end
@@ -472,13 +478,23 @@ function Army:Update(now)
   Skin():SetBar(self.sizeBar, used / army.RESERVE_CAPACITY, used >= army.RESERVE_CAPACITY and "red" or "gold")
   local area, where = army:Place()
   Show(self.placeIcon, area ~= nil)
+  local textX = area and 264 or 226
+  Place(self.place, self.reservePanel, textX, -26)
+  Place(self.placeName, self.reservePanel, textX, -42)
+  self.place:SetWidth(446 - textX)
+  self.placeName:SetWidth(446 - textX)
   if area then
     Window.SetPoiIcon(self.placeIcon, area, faction)
     SetText(self.place, Paint("GOOD", "Recruitment open:"))
     SetText(self.placeName, Paint("GOOD", AreaName(area)))
   else
-    SetText(self.place, Paint("BAD", "Recruitment closed:"))
-    SetText(self.placeName, Paint("BAD", tostring(where)))
+    if string.find(tostring(where), "^go inside") then
+      SetText(self.place, Paint("BAD", "Recruitment unavailable: enter a friendly"))
+      SetText(self.placeName, Paint("BAD", "Outposts or Settlements"))
+    else
+      SetText(self.place, Paint("BAD", "Recruitment closed:"))
+      SetText(self.placeName, Paint("BAD", tostring(where)))
+    end
   end
   local index = 1
   while index <= 3 do
@@ -554,6 +570,19 @@ function Territory:Build()
     row.dot = Skin():Icon(row, nil, 14, 14)
     Place(row.dot, row, 344, -3)
     row.source = NewText(row, "GameFontHighlightSmall", 362, -4, 120)
+    local hit = CreateFrame("Frame", nil, row)
+    hit:SetWidth(138)
+    hit:SetHeight(18)
+    hit:SetPoint("TOPLEFT", row, "TOPLEFT", 342, -2)
+    hit:EnableMouse(true)
+    hit:SetScript("OnEnter", function()
+      if not row.sourceTip then return end
+      GameTooltip:SetOwner(this, "ANCHOR_CURSOR", 10, 10)
+      GameTooltip:AddLine(row.sourceTip[1], 1, 1, 1)
+      GameTooltip:AddLine(row.sourceTip[2], 0.8, 0.8, 0.8, 1)
+      GameTooltip:Show()
+    end)
+    hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
     row.details = NewText(row, "GameFontHighlightSmall", 486, -4, 104)
   end)
   self.poiIds = {}
@@ -577,10 +606,10 @@ function Territory:Build()
 
   panel = NewPanel(self, "Legend: Source / Status", 0, -362, CONTENT_WIDTH, CONTENT_HEIGHT - 362)
   local chips = {
-    { "dot.green", "Seen by you", "your own client saw it" },
+    { "dot.green", "Confirmed", "your own client saw it" },
     { "dot.yellow", "Reported", "told on the channel, unverified" },
     { "dot.grey", "Unconfirmed", "players claim another owner" },
-    { "dot.empty", "Not observed", "nothing seen since login" },
+    { "dot.empty", "Not captured yet", "nothing seen since login" },
   }
   local width = math.floor((CONTENT_WIDTH - 12) / 4)
   index = 1
@@ -598,6 +627,24 @@ local function Capturing(info)
   return info and info.challenger and info.challenger ~= "-" and (info.percent or 0) >= 50 and info.challenger or nil
 end
 
+-- Same owner as the map: with no confirmed owner, show the unconfirmed one
+-- (cloud or players' hint). The counter and the list both use it.
+local function ShownOwner(capture, id, now)
+  local owner, _, source = capture:GetOwner(id)
+  local info = capture:TooltipInfo(id, now)
+  local guess
+  if owner == "N" and capture:Capturable(id) and info then
+    if info.cloud then
+      local _, code = capture.CloudLine(info.cloud)
+      guess = code
+    elseif info.hint then
+      guess = info.hint.owner
+    end
+    if guess ~= "A" and guess ~= "H" then guess = nil end
+  end
+  return guess or owner, info, source
+end
+
 function Territory:Update(now)
   local map, capture = PC.Map, PC.Capture
   if not map or not capture then
@@ -612,8 +659,8 @@ function Territory:Update(now)
     local area = map.areas[id]
     if not area or not area.enabled or not TERRITORY_TYPES[area.type] then return false end
     if capture:Capturable(id) then
-      local owner = capture:GetOwner(id)
-      counts[owner] = (counts[owner] or 0) + 1
+      local shown = ShownOwner(capture, id, now)
+      counts[shown] = (counts[shown] or 0) + 1
     end
     return true
   end)
@@ -624,24 +671,27 @@ function Territory:Update(now)
   FillList(self.pois, count, function(row, item)
     local id = self.poiIds[item]
     local area = map.areas[id]
-    local owner, _, source = capture:GetOwner(id)
-    local info = capture:TooltipInfo(id, now)
-    Window.SetPoiIcon(row.icon, area, owner, Capturing(info))
+    -- The source column says when the shown owner is unconfirmed.
+    local shown, info, source = ShownOwner(capture, id, now)
+    Window.SetPoiIcon(row.icon, area, shown, Capturing(info))
     SetText(row.name, AreaName(area) .. " " .. AreaZone(area))
-    Skin():Apply(row.badge, owner == "A" and "badge.alliance" or owner == "H" and "badge.horde" or "badge.neutral")
-    SetText(row.owner, FactionText(owner))
+    Skin():Apply(row.badge, shown == "A" and "badge.alliance" or shown == "H" and "badge.horde" or "badge.neutral")
+    SetText(row.owner, FactionText(shown))
     if not capture:Capturable(id) then
       Skin():Apply(row.dot, "dot.empty")
       SetText(row.source, Paint("DIM", "Not capturable yet"))
+      row.sourceTip = { "Not capturable yet", "This place cannot be conquered yet." }
     elseif info and info.cloud then
-      local label, code = capture.CloudLine(info.cloud)
       Skin():Apply(row.dot, "dot.grey")
-      SetText(row.source, code and (label .. ": " .. FactionText(code)) or label)
+      SetText(row.source, "Unconfirmed")
+      row.sourceTip = SOURCE_TIPS.UNCONFIRMED
     elseif info and info.hint then
       Skin():Apply(row.dot, "dot.grey")
-      SetText(row.source, "Unconfirmed: " .. FactionText(info.hint.owner))
+      SetText(row.source, "Unconfirmed")
+      row.sourceTip = SOURCE_TIPS.UNCONFIRMED
     else
       Skin():Apply(row.dot, SOURCE_DOTS[source] or "dot.empty")
+      row.sourceTip = SOURCE_TIPS[source or ""] or SOURCE_TIPS.STATIC
       SetText(row.source, source == "LOCAL" and SOURCE_LABELS.LOCAL or source == "PEER" and SOURCE_LABELS.PEER
         or Paint("DIM", SOURCE_LABELS.STATIC))
     end
@@ -652,7 +702,7 @@ function Territory:Update(now)
       SetText(row.details, map.LevelText(area) or Paint("DIM", "Level 1"))
     elseif info and info.cloud then
       local _, _, detail = capture.CloudLine(info.cloud)
-      SetText(row.details, Paint("DIM", detail))
+      SetText(row.details, Paint("DIM", detail or "-"))
     elseif info and info.hint then
       SetText(row.details, Paint("DIM", info.hint.count .. " player(s), " .. Duration(info.hint.age) .. " ago"))
     else
@@ -982,8 +1032,8 @@ function War:Build()
   self.capacity = NewText(panel, "GameFontHighlightSmall", 38, -24, 150)
   self.capacityBar = Skin():Bar(panel, 140, 10, "gold")
   Place(self.capacityBar, panel, 38, -38)
-  self.from = NewText(panel, "GameFontHighlightSmall", 196, -24, 196)
-  self.target = NewText(panel, "GameFontHighlightSmall", 196, -38, 196)
+  self.from = NewText(panel, "GameFontHighlightSmall", 196, -24, 360)
+  self.target = NewText(panel, "GameFontHighlightSmall", 196, -38, 360)
   self.targetIcon = Skin():Icon(panel, nil, 24, 24)
   Place(self.targetIcon, panel, 566, -22)
   self.cells = {}
@@ -1287,7 +1337,7 @@ local function GuideSteps()
     { "Attack", "guide.attack", "Pick a found target, choose units within your Assault Capacity and send them. They never come back." },
     { "Conquer", "guide.conquer", "Hold its zone, empty its garrison, scout it, then " .. capture.SIEGE_ATTACKERS
       .. " players stand inside for " .. math.floor(capture.SETTLEMENT_DURATION / 60) .. " minutes." },
-    { "Shared, not verified", "icon.warning", "Players share everything on the PandaConquest channel; no server checks it. See the Territory tab." },
+    { "A living world", "icon.warning", "The war moves as players play. Some news can arrive late: the Territory tab shows how fresh it is." },
   }
 end
 Window.GuideSteps = GuideSteps
@@ -1574,6 +1624,42 @@ function Window.LockText()
     .. " Guide tab explains how the conquest works."
 end
 
+-- Rotates the loading arrow by `angle` radians around its centre (1.12 has no
+-- SetRotation: the four corners are given to the 8-value SetTexCoord).
+local function RotateArrow(texture, angle)
+  local cos, sin = math.cos(angle), math.sin(angle)
+  local function corner(x, y)
+    return 0.5 + (x - 0.5) * cos - (y - 0.5) * sin, 0.5 + (x - 0.5) * sin + (y - 0.5) * cos
+  end
+  local ulx, uly = corner(0, 0)
+  local llx, lly = corner(0, 1)
+  local urx, ury = corner(1, 0)
+  local lrx, lry = corner(1, 1)
+  texture:SetTexCoord(ulx, uly, llx, lly, urx, ury, lrx, lry)
+end
+
+-- Spinning arrow and "Loading" while the companion connects (decision 0059).
+local function NewSpinner(frame)
+  local spinner = GetGlobal("CreateFrame")("Frame", nil, frame)
+  spinner:SetWidth(120)
+  spinner:SetHeight(24)
+  spinner:SetPoint("TOP", frame, "TOP", 0, -215)
+  spinner.arrow = spinner:CreateTexture(nil, "ARTWORK")
+  spinner.arrow:SetTexture("Interface\\AddOns\\pandaConquest\\media\\Textures\\UI\\LoadingArrow")
+  spinner.arrow:SetWidth(24)
+  spinner.arrow:SetHeight(24)
+  spinner.arrow:SetPoint("LEFT", spinner, "LEFT", 0, 0)
+  spinner.label = NewText(spinner, "GameFontNormal", 32, -5, 88, "LEFT")
+  SetText(spinner.label, "Loading")
+  spinner.angle = 0
+  spinner:SetScript("OnUpdate", function()
+    local elapsed = arg1 or 0
+    this.angle = math.mod(this.angle - elapsed * 4, 6.2831853)
+    RotateArrow(this.arrow, this.angle)
+  end)
+  return spinner
+end
+
 function Window:ShowLock()
   if not self.lock then
     local frame = GetGlobal("CreateFrame")("Frame", nil, self.frame)
@@ -1586,8 +1672,10 @@ function Window:ShowLock()
     frame.text = NewText(frame, "GameFontHighlight", 48, -160, CONTENT_WIDTH - 96, "CENTER")
     frame.text:SetHeight(200)
     frame.text:SetJustifyV("TOP")
+    frame.spinner = NewSpinner(frame)
     self.lock = frame
   end
+  Show(self.lock.spinner, PC.Companion and PC.Companion.state == "WAITING" and CompanionNotice() ~= nil)
   SetText(self.lock.title, Paint("GOLD", Window.LockTitle()))
   SetText(self.lock.text, Window.LockText())
   if not self.lock:IsShown() then self.lock:Show() end
@@ -1648,8 +1736,12 @@ function Window:Build()
   self.status:SetPoint("LEFT", status, "LEFT", 44 - inset, 0)
   self.status:SetWidth(320)
   self.summary = Skin():Text(status, "GameFontHighlightSmall", "RIGHT")
-  self.summary:SetPoint("RIGHT", status, "RIGHT", inset - 44, 0)
-  self.summary:SetWidth(220)
+  self.summary:SetPoint("RIGHT", status, "RIGHT", inset - 44 - 56, 0)
+  self.summary:SetWidth(330)
+  self.versionLabel = Skin():Text(status, "GameFontDisableSmall", "RIGHT")
+  self.versionLabel:SetPoint("RIGHT", status, "RIGHT", inset - 44, 0)
+  self.versionLabel:SetWidth(52)
+  self.versionLabel:SetText("v" .. tostring(PC.version))
   self:BuildTabs()
 
   -- Escape closes the frames listed in UISpecialFrames (FrameXML UIParent.lua).
@@ -1750,9 +1842,9 @@ function Window:Toggle()
   return true
 end
 
+Window:AddTab("map", "Territory", Territory)
 Window:AddTab("res", "Resources", Resources)
 Window:AddTab("army", "Army", Army)
-Window:AddTab("map", "Territory", Territory)
 Window:AddTab("garrison", "Garrison", Garrison, Window.InGarrison)
 Window:AddTab("war", "War", War)
 Window:AddTab("guide", "Guide", Guide)

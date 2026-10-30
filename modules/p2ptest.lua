@@ -1814,6 +1814,7 @@ local function SlashCommand(message)
       .. " patches=" .. tostring(status.patches)
       .. " icons=" .. tostring(status.icons)
       .. " building=" .. tostring(status.building)
+      .. " zoneBars=" .. tostring(status.zoneBars)
       .. " failures=" .. tostring(status.failures))
     if PC.MinimapAreas then
       local mini = PC.MinimapAreas:GetStatus()

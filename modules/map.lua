@@ -272,8 +272,8 @@ local function NormalizeDefinition(definition)
     local radius = definition.radius
     local centerX = definition.x or copiedLocations[1].x
     local centerY = definition.y or copiedLocations[1].y
-    if type(radius) ~= "number" or radius < 0.5 or radius > 20 then
-      return nil, "circle radius must be a number from 0.5 to 20"
+    if type(radius) ~= "number" or radius < 0.15 or radius > 10 then
+      return nil, "circle radius must be a number from 0.15 to 10"
     end
     if type(centerX) ~= "number" or type(centerY) ~= "number"
         or centerX < 0 or centerX > 100 or centerY < 0 or centerY > 100 then
@@ -467,6 +467,44 @@ function Map:SetEnabled(enabled)
   self.enabled = enabled and true or false
   self.dirty = true
   if not self.enabled then self:HideAll() end
+end
+
+local function Settings()
+  local storage = PC.Storage
+  if not storage or type(storage.GetDB) ~= "function" or storage.readOnly then return nil end
+  local db = storage:GetDB()
+  if type(db) ~= "table" or type(db.settings) ~= "table" then return nil end
+  return db.settings
+end
+
+-- Player choice from the world map checkbox, saved in
+-- PandaConquestDB.settings.mapHidden. Hides the world map and minimap drawing.
+function Map:Hidden()
+  local settings = Settings()
+  if settings then return settings.mapHidden and true or false end
+  return self.hidden and true or false
+end
+
+function Map:SetHidden(hidden)
+  self.hidden = hidden and true or false
+  local settings = Settings()
+  if settings then settings.mapHidden = self.hidden or nil end
+  self.dirty = true
+  self:SyncToggle()
+  if self.hidden then
+    self:HideAll()
+    self.lastSignature = nil
+  else
+    self:Refresh(true)
+  end
+end
+
+function Map:SyncToggle()
+  local tick = self.toggle and self.toggle.tick
+  if not tick then return end
+  if self:Hidden() then HideObject(tick) elseif type(tick.Show) == "function" then
+    pcall(tick.Show, tick)
+  end
 end
 
 local function GetCanvas()
@@ -1229,7 +1267,285 @@ local function DrawRoutes(mapKey, width, height)
   if PC.RecordError then PC.RecordError("map routes", err) end
 end
 
+-- Zone capture bars on the continent maps -----------------------------------
+-- On a continent map, each zone holding controlled POIs (Outposts,
+-- Settlements, Hunting Grounds) shows the Capture HUD bar at the middle of
+-- the zone: same textures, Alliance blue from the left, Horde red from the
+-- right, grey for the neutral rest, percents inside, faction badges on each
+-- side. Shares are the number of POIs each faction holds, from the owner color
+-- the zone map shows. Local display only: nothing is sent.
+-- Each zone map's rectangle on its continent map: continent key (canonical
+-- GetMapInfo name), left, top, width, height in continent map units. Values
+-- from the OctoWoW client's own WorldMapArea.dbc (patch-3.mpq), as extracted
+-- by PandaQuest's tools/import_worldmap_dbc.py; its Eastern Kingdoms
+-- rectangle differs from the later clients' values (2026-10-31: bars were too
+-- low with those). tools/smoke.py checks every zone with controlled POIs in
+-- data/pois.lua has an entry.
+local CONTINENT_ZONES = {
+  elwynn = { "azeroth", 0.410927, 0.656515, 0.098603, 0.098633 },
+  westfall = { "azeroth", 0.368846, 0.718749, 0.099432, 0.099432 },
+  hilsbrad = { "azeroth", 0.424244, 0.301134, 0.090909, 0.090909 },
+  arathi = { "azeroth", 0.479168, 0.323862, 0.102273, 0.102273 },
+  durotar = { "kalimdor", 0.517098, 0.448028, 0.143683, 0.143683 },
+  barrens = { "kalimdor", 0.392493, 0.456011, 0.275364, 0.275392 },
+}
+Map.CONTINENT_ZONES = CONTINENT_ZONES
+local CONTINENT_KEYS = { azeroth = true, kalimdor = true }
+local ZONE_BAR_TEXTURE = "Interface\\Buttons\\WHITE8X8"
+-- The HUD bar at 40 % of its 176 px width (map.bar.frame, the hud.bar.frame
+-- sprite redrawn 70 px wide so the stroke keeps its weight) with the HUD's
+-- 16 x 19 badges, scaled down as one frame.
+local ZONE_BAR_WIDTH = 70
+local ZONE_BAR_HEIGHT = 12
+local ZONE_BAR_INSET = 2
+local ZONE_BAR_INNER = ZONE_BAR_WIDTH - 2 * ZONE_BAR_INSET
+local ZONE_BAR_SCALE = 0.75
+local ZONE_BADGE_WIDTH, ZONE_BADGE_HEIGHT = 16, 19
+local ZONE_BAR_NEUTRAL = { 0.45, 0.45, 0.45 }
+Map.zoneBars = { slots = {}, count = 0 }
+
+-- The displayed continent's key, or nil on a zone or the world map.
+local function CurrentContinentKey()
+  local getZone, getMapInfo = GetGlobal("GetCurrentMapZone"), GetGlobal("GetMapInfo")
+  if type(getZone) ~= "function" or type(getMapInfo) ~= "function" then return nil end
+  local zoneOk, zoneIndex = pcall(getZone)
+  if not zoneOk or zoneIndex ~= 0 then return nil end
+  local ok, name = pcall(getMapInfo)
+  if not ok then return nil end
+  local key = CanonicalMapName(name)
+  if key and CONTINENT_KEYS[key] then return key end
+  return nil
+end
+
+-- One entry per zone of the continent with controlled POIs, in POI order:
+-- mapKey, total, alliance and horde counts and shares, and the bar anchor
+-- (middle of the zone's rectangle) in units of the continent map.
+function Map:ZoneShares(continentKey)
+  local list = {}
+  if not CONTINENT_KEYS[continentKey or ""] then return list end
+  local zones = {}
+  local index = 1
+  while index <= table.getn(self.order) do
+    local area = self.areas[self.order[index]]
+    local zone = area and area.enabled and CONTINENT_ZONES[area.mapKey or ""]
+    if zone and zone[1] == continentKey and Map.POI_TYPES[area.type]
+        and not Map.RESOURCE_TYPES[area.type] then
+      local entry = zones[area.mapKey]
+      if not entry then
+        entry = {
+          mapKey = area.mapKey, total = 0, alliance = 0, horde = 0,
+          x = zone[2] + zone[4] / 2,
+          y = zone[3] + zone[5] / 2,
+        }
+        zones[area.mapKey] = entry
+        table.insert(list, entry)
+      end
+      entry.total = entry.total + 1
+      if area.colorKey == "ALLIANCE" then
+        entry.alliance = entry.alliance + 1
+      elseif area.colorKey == "HORDE" then
+        entry.horde = entry.horde + 1
+      end
+    end
+    index = index + 1
+  end
+  index = 1
+  while index <= table.getn(list) do
+    local entry = list[index]
+    entry.allianceShare = entry.alliance / entry.total
+    entry.hordeShare = entry.horde / entry.total
+    index = index + 1
+  end
+  return list
+end
+
+-- Applies the part x0..x1 of an atlas piece, or the plain color when the
+-- skin or the piece is missing. False when no atlas piece was used.
+local function ZoneBarPiece(texture, piece, color, x0, x1)
+  local skin = PC.Skin
+  if skin and type(skin.Apply) == "function" and skin:Apply(texture, piece, x0, x1) then
+    return true
+  end
+  texture:SetTexture(ZONE_BAR_TEXTURE)
+  texture:SetTexCoord(0, 1, 0, 1)
+  if color then texture:SetVertexColor(color[1], color[2], color[3], color[4] or 1) end
+  return false
+end
+
+local function ZoneBarFillTexture(frame, layer, piece, color, fromRight)
+  local texture = frame:CreateTexture(nil, layer)
+  ZoneBarPiece(texture, piece, color)
+  texture:SetHeight(ZONE_BAR_HEIGHT - 2 * ZONE_BAR_INSET)
+  texture.fillPiece = piece
+  texture.fillColor = color
+  texture.fillFromRight = fromRight
+  if fromRight then
+    texture:SetPoint("RIGHT", frame, "RIGHT", -ZONE_BAR_INSET, 0)
+  else
+    texture:SetPoint("LEFT", frame, "LEFT", ZONE_BAR_INSET, 0)
+  end
+  return texture
+end
+
+-- Percents inside the bar, like the HUD, outlined to stay readable on the map.
+local function ZoneBarText(frame, point, x)
+  local text = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  text:SetPoint(point, frame, point, x, 0.5)
+  if text.SetJustifyH then text:SetJustifyH(point) end
+  if text.GetFont and text.SetFont then
+    local path, size = text:GetFont()
+    if path and type(size) == "number" then text:SetFont(path, size, "OUTLINE") end
+  end
+  return text
+end
+
+local function ZoneBarBadge(frame, piece, point, relative, x)
+  local badge = frame:CreateTexture(nil, "OVERLAY")
+  badge:SetWidth(ZONE_BADGE_WIDTH)
+  badge:SetHeight(ZONE_BADGE_HEIGHT)
+  badge:SetPoint(point, frame, relative, x, 0)
+  local skin = PC.Skin
+  badge.skinned = skin and type(skin.Apply) == "function" and skin:Apply(badge, piece) or false
+  return badge
+end
+
+local function ZoneBarSlot(bars, index)
+  local slot = bars.slots[index]
+  if slot then return slot end
+  if not bars.frame then bars.frame = CreateGroup("PandaConquestMapZoneBars", 3) end
+  local group = bars.frame
+  local create = GetGlobal("CreateFrame")
+  if not group or type(create) ~= "function" then return nil end
+  local ok = pcall(function()
+    -- An unscaled 1 px holder takes the map position; the scaled bar sits on
+    -- it with no offset, so the position never depends on the bar's scale.
+    local holder = create("Frame", nil, group)
+    holder:SetWidth(1)
+    holder:SetHeight(1)
+    if type(holder.EnableMouse) == "function" then holder:EnableMouse(false) end
+    local frame = create("Frame", nil, holder)
+    frame:SetWidth(ZONE_BAR_WIDTH)
+    frame:SetHeight(ZONE_BAR_HEIGHT)
+    frame:SetScale(ZONE_BAR_SCALE)
+    frame:SetPoint("CENTER", holder, "CENTER", 0, 0)
+    if type(frame.EnableMouse) == "function" then frame:EnableMouse(false) end
+    -- 1.12 has no texture sublevels: grey base, then the frame, then the fills.
+    local neutral = ZoneBarFillTexture(frame, "BACKGROUND", "fill.grey", ZONE_BAR_NEUTRAL)
+    neutral:SetWidth(ZONE_BAR_INNER)
+    local border = frame:CreateTexture(nil, "BORDER")
+    border:SetAllPoints(frame)
+    if not ZoneBarPiece(border, "map.bar.frame") then border:SetVertexColor(0, 0, 0, 0) end
+    slot = {
+      holder = holder, frame = frame, border = border, neutral = neutral,
+      alliance = ZoneBarFillTexture(frame, "ARTWORK", "fill.blue", Map.COLORS.ALLIANCE),
+      horde = ZoneBarFillTexture(frame, "ARTWORK", "fill.red", Map.COLORS.HORDE, true),
+      left = ZoneBarText(frame, "LEFT", 7),
+      right = ZoneBarText(frame, "RIGHT", -7),
+      badgeA = ZoneBarBadge(frame, "badge.alliance", "RIGHT", "LEFT", -1),
+      badgeH = ZoneBarBadge(frame, "badge.horde", "LEFT", "RIGHT", 1),
+    }
+  end)
+  if not ok or not slot then return nil end
+  bars.slots[index] = slot
+  return slot
+end
+
+-- Fill width for a share, cropping the atlas piece (as the HUD does) so the
+-- gradient is not squeezed.
+local function ZoneBarFill(texture, share)
+  if share <= 0.001 then
+    HideObject(texture)
+    return
+  end
+  share = math.min(1, share)
+  texture:SetWidth(math.max(1, ZONE_BAR_INNER * share))
+  local skin = PC.Skin
+  local piece = skin and type(skin.Piece) == "function" and skin:Piece(texture.fillPiece)
+  if piece then
+    local shown = piece.w * share
+    if texture.fillFromRight then
+      ZoneBarPiece(texture, texture.fillPiece, texture.fillColor, piece.w - shown, piece.w)
+    else
+      ZoneBarPiece(texture, texture.fillPiece, texture.fillColor, 0, shown)
+    end
+  end
+  texture:Show()
+end
+
+local function ZoneBarPercent(share)
+  if share <= 0.001 then return "" end
+  return math.floor(share * 100 + 0.5) .. "%"
+end
+
+local function HideZoneBarSlot(slot)
+  HideObject(slot.holder)
+end
+
+function Map:HideZoneBars()
+  local bars = self.zoneBars
+  local index = 1
+  while index <= table.getn(bars.slots) do
+    HideZoneBarSlot(bars.slots[index])
+    index = index + 1
+  end
+  if bars.frame then HideObject(bars.frame) end
+  bars.count = 0
+end
+
+function Map:RefreshZoneBars(continentKey, width, height)
+  local bars = self.zoneBars
+  local zones = self:ZoneShares(continentKey)
+  local canvas = GetCanvas()
+  local used = 0
+  local index = 1
+  while index <= table.getn(zones) do
+    local zone = zones[index]
+    local slot = ZoneBarSlot(bars, used + 1)
+    if not slot then break end
+    used = used + 1
+    slot.mapKey = zone.mapKey
+    slot.x, slot.y = zone.x, zone.y
+    slot.allianceShare, slot.hordeShare = zone.allianceShare, zone.hordeShare
+    slot.holder:ClearAllPoints()
+    slot.holder:SetPoint("CENTER", bars.frame, "TOPLEFT", zone.x * width, -zone.y * height)
+    ZoneBarFill(slot.alliance, zone.allianceShare)
+    ZoneBarFill(slot.horde, zone.hordeShare)
+    slot.left:SetText(ZoneBarPercent(zone.allianceShare))
+    slot.right:SetText(ZoneBarPercent(zone.hordeShare))
+    if slot.badgeA.skinned then slot.badgeA:Show() else HideObject(slot.badgeA) end
+    if slot.badgeH.skinned then slot.badgeH:Show() else HideObject(slot.badgeH) end
+    slot.frame:Show()
+    slot.holder:Show()
+    index = index + 1
+  end
+  index = used + 1
+  while index <= table.getn(bars.slots) do
+    HideZoneBarSlot(bars.slots[index])
+    index = index + 1
+  end
+  bars.count = used
+  if bars.frame then
+    if used > 0 then
+      if canvas and type(bars.frame.SetAllPoints) == "function" then
+        pcall(bars.frame.SetAllPoints, bars.frame, canvas)
+      end
+      bars.frame:Show()
+    else
+      HideObject(bars.frame)
+    end
+  end
+end
+
+-- Draws the zone bars of a continent map, hiding them if anything fails.
+local function DrawZoneBars(continentKey, width, height)
+  local ok, err = pcall(Map.RefreshZoneBars, Map, continentKey, width, height)
+  if ok then return end
+  pcall(Map.HideZoneBars, Map)
+  if PC.RecordError then PC.RecordError("map zone bars", err) end
+end
+
 function Map:HideAll()
+  self:HideZoneBars()
   self:HideRoutes()
   self:ClearHover()
   local index = 1
@@ -1248,6 +1564,7 @@ end
 -- Refresh rebuilds the visible state.
 function Map:SuspendForClose()
   self:HideAll()
+  HideObject(self.toggle)
   self.dirty = true
   self.lastSignature = nil
 end
@@ -1281,15 +1598,35 @@ function Map:Locked()
 end
 
 function Map:Refresh(force)
+  local toggle = self.toggle
+  if toggle and type(toggle.IsShown) == "function" and not toggle:IsShown() then
+    pcall(toggle.Show, toggle)
+  end
+  if toggle then self:LayoutToggle() end
   local canvas = GetCanvas()
   local mapName = GetCurrentMapFile()
   local mapKey = CanonicalMapName(mapName)
   local width, height = GetCanvasSize(canvas)
-  if not self.enabled or self:Locked() or not Contours or not canvas or not mapKey or not width then
+  local continentKey = not mapKey and CurrentContinentKey() or nil
+  if continentKey and self.enabled and not self:Hidden() and not self:Locked()
+      and canvas and width then
+    -- Continent map: only the zone bars; the zone groups and routes hide once.
+    local signature = "continent|" .. continentKey
+    if self.lastSignature ~= signature then
+      self:HideAll()
+      self.lastSignature = signature
+      self.currentMap = continentKey
+    end
+    DrawZoneBars(continentKey, width, height)
+    return true
+  end
+  if not self.enabled or self:Hidden() or self:Locked() or not Contours or not canvas
+      or not mapKey or not width then
     self:HideAll()
     self.lastSignature = nil
     return false
   end
+  if self.zoneBars.count > 0 then self:HideZoneBars() end
 
   local signature = mapKey .. "|" .. tostring(width) .. "|" .. tostring(height)
     .. "|" .. tostring(self.revision)
@@ -1359,6 +1696,7 @@ function Map:GetStatus()
   end
   return {
     enabled = self.enabled,
+    hidden = self:Hidden(),
     locked = self:Locked(),
     registered = table.getn(self.order),
     map = self.currentMap,
@@ -1370,6 +1708,7 @@ function Map:GetStatus()
     cached = self.cacheCount,
     routes = self.routes.count,
     routeDots = self.routes.dotCount,
+    zoneBars = self.zoneBars.count,
   }
 end
 
@@ -1472,17 +1811,17 @@ local function ShowAreaTooltip(canvas, area)
     if area.label then tooltip:AddLine(typeName, 1, 1, 1) end
     -- Capturable areas follow the owner registry; others keep their drawn color.
     if not Map.RESOURCE_TYPES[area.type] then
-      AddFactionLine(tooltip, "Owner", info and info.owner or OWNER_CODES[area.colorKey or ""] or "N")
+      AddFactionLine(tooltip, "Confirmed owner", info and info.owner or OWNER_CODES[area.colorKey or ""] or "N")
     end
     if info and info.hint then
-      AddFactionLine(tooltip, "Unconfirmed", info.hint.owner, " (" .. info.hint.count .. " player(s), "
+      AddFactionLine(tooltip, "Unconfirmed owner", info.hint.owner, " (" .. info.hint.count .. " player(s), "
         .. FormatDuration(info.hint.age) .. " ago)")
     end
     -- Cloud owner (decision 0060): shown only, never an owner for gameplay.
     if info and info.cloud and PC.Capture then
       local label, code, detail = PC.Capture.CloudLine(info.cloud)
       if code then
-        AddFactionLine(tooltip, label, code, " (" .. detail .. ")")
+        AddFactionLine(tooltip, label, code, detail and (" (" .. detail .. ")") or nil)
       else
         tooltip:AddDoubleLine(label, detail, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
       end
@@ -1993,3 +2332,168 @@ if type(toggleWorldMap) == "function" and mapFrame and type(mapFrame.IsVisible) 
     return toggleWorldMap()
   end
 end
+
+-- Show/hide checkbox for our icons, areas and routes, in the map header right
+-- of the Zoom Out button (left of Maximize on the minimized map), without
+-- background. Same parent and strata as that button, a level above it and the
+-- map canvas, so neither the header art nor the map covers it. Owned box and tick
+-- (pandaUI's Modern WoW settings checkbox, MapCheckbox.tga), not a CheckButton
+-- whose stock checked art the client puts back.
+local TOGGLE = {
+  zoomGap = 10, maximizeGap = 4, raise = 5, x = 160, y = -41,
+  gap = 5, boxWidth = 18, boxHeight = 17.4,
+  texture = "Interface\\AddOns\\pandaConquest\\media\\Textures\\UI\\MapCheckbox",
+  box = { 1 / 64, 31 / 64, 1 / 64, 30 / 64 },
+  tick = { 1 / 64, 31 / 64, 32 / 64, 61 / 64 },
+}
+
+local function ToggleTexture(button, layer, coords)
+  local texture = button:CreateTexture(nil, layer)
+  texture:SetTexture(TOGGLE.texture)
+  texture:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+  texture:SetWidth(TOGGLE.boxWidth)
+  texture:SetHeight(TOGGLE.boxHeight)
+  texture:SetPoint("LEFT", button, "LEFT", 0, 0)
+  return texture
+end
+
+-- Without a Zoom Out button the box sits on the map canvas; the zoom addons
+-- load after us, so their pin is asked when it shows.
+local function PinToggle(button)
+  if button.header then return end
+  local pandaUI = GetGlobal("PandaUI")
+  if type(pandaUI) == "table" and type(pandaUI.WorldMapZoomPin) == "function" then
+    pcall(pandaUI.WorldMapZoomPin, button, "LEFT", "TOP", TOGGLE.x, TOGGLE.y)
+  end
+  local zoom = GetGlobal("PandaMapZoom")
+  if type(zoom) == "table" and type(zoom.Pin) == "function" then
+    pcall(zoom.Pin, button, "LEFT", "TOP", TOGGLE.x, TOGGLE.y)
+  end
+end
+
+-- The header's parent frame (the Zoom Out or Maximize button's), or nil.
+local function MapHeader()
+  local names = { "WorldMapZoomOutButton", "WorldMapFrameMaximizeButton" }
+  local index = 1
+  while index <= 2 do
+    local button = GetGlobal(names[index])
+    if button and type(button.GetParent) == "function" then
+      local ok, parent = pcall(button.GetParent, button)
+      if ok and parent then return parent end
+    end
+    index = index + 1
+  end
+  return nil
+end
+
+-- "windowed" (minimized map: left of the Maximize button), "full" (right of
+-- Zoom Out) or "canvas" (no header), with the anchor button.
+local function ToggleMode(button)
+  if not button.header then return "canvas", nil end
+  local maximize = GetGlobal("WorldMapFrameMaximizeButton")
+  local windowed = GetGlobal("WORLDMAP_WINDOWED") == 1
+  if maximize and not windowed and type(maximize.IsShown) == "function" then
+    local shownOk, shown = pcall(maximize.IsShown, maximize)
+    windowed = shownOk and shown and true or false
+  end
+  if windowed and maximize then return "windowed", maximize end
+  local zoomOut = GetGlobal("WorldMapZoomOutButton")
+  if zoomOut then return "full", zoomOut end
+  return "canvas", nil
+end
+
+local function FrameLevelOf(frame)
+  if not frame or type(frame.GetFrameLevel) ~= "function" then return 0 end
+  local ok, level = pcall(frame.GetFrameLevel, frame)
+  return ok and type(level) == "number" and level or 0
+end
+
+-- Strata of the anchor button and a level above it and the map canvas: the
+-- minimized map lowers its frame (SetFrameLevel(0)) under the map content.
+local function RaiseToggle(button, anchor)
+  if anchor and type(anchor.GetFrameStrata) == "function" and type(button.SetFrameStrata) == "function" then
+    local strataOk, strata = pcall(anchor.GetFrameStrata, anchor)
+    if strataOk and strata then pcall(button.SetFrameStrata, button, strata) end
+  end
+  local level = math.max(FrameLevelOf(anchor), FrameLevelOf(GetCanvas())) + TOGGLE.raise
+  if type(button.SetFrameLevel) == "function" and FrameLevelOf(button) ~= level then
+    pcall(button.SetFrameLevel, button, level)
+  end
+end
+
+-- Re-anchors on a map mode change only; the raise runs then and on every show.
+function Map:LayoutToggle(force)
+  local button = self.toggle
+  if not button or type(button.SetPoint) ~= "function" then return end
+  local mode, anchor = ToggleMode(button)
+  if mode ~= button.mode then
+    button.mode = mode
+    if type(button.ClearAllPoints) == "function" then button:ClearAllPoints() end
+    if mode == "windowed" then
+      button:SetPoint("RIGHT", anchor, "LEFT", -TOGGLE.maximizeGap, 0)
+    elseif mode == "full" then
+      button:SetPoint("LEFT", anchor, "RIGHT", TOGGLE.zoomGap, 0)
+    else
+      button:SetPoint("LEFT", GetCanvas(), "TOP", TOGGLE.x, TOGGLE.y)
+    end
+    force = true
+  end
+  if force then RaiseToggle(button, anchor) end
+end
+
+local function ToggleLabelColor(button, hovered)
+  local label = button.label
+  if label and type(label.SetTextColor) == "function" then
+    if hovered then label:SetTextColor(1, 0.82, 0) else label:SetTextColor(1, 1, 1) end
+  end
+end
+
+local function CreateToggle()
+  local canvas = GetCanvas()
+  if not canvas or type(create) ~= "function" then return end
+  local header = MapHeader()
+  local parent = header or canvas
+  local ok, button = pcall(create, "Button", "PandaConquestMapToggle", parent)
+  if not ok or not button or type(button.SetScript) ~= "function" then return end
+  Map.toggle = button
+  button.header = header and true or nil
+
+  if type(button.CreateTexture) == "function" and type(button.SetPoint) == "function" then
+    ToggleTexture(button, "ARTWORK", TOGGLE.box)
+    button.tick = ToggleTexture(button, "OVERLAY", TOGGLE.tick)
+    local width = TOGGLE.boxWidth
+    if type(button.CreateFontString) == "function" then
+      local label = button:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+      if type(label.GetFont) == "function" and type(label.SetFont) == "function" then
+        local font, size = label:GetFont()
+        if font and size then label:SetFont(font, size, "OUTLINE") end
+      end
+      label:SetPoint("LEFT", button, "LEFT", TOGGLE.boxWidth + TOGGLE.gap, 0)
+      label:SetText("PandaConquest")
+      button.label = label
+      local measured = type(label.GetStringWidth) == "function" and label:GetStringWidth()
+      width = width + TOGGLE.gap + (type(measured) == "number" and measured > 0 and measured or 90)
+    end
+    button:SetWidth(width)
+    button:SetHeight(20)
+    if type(button.EnableMouse) == "function" then button:EnableMouse(true) end
+    if type(button.RegisterForClicks) == "function" then button:RegisterForClicks("LeftButtonUp") end
+  end
+  Map:LayoutToggle(true)
+
+  button:SetScript("OnShow", function()
+    PinToggle(button)
+    Map:LayoutToggle(true)
+    Map:SyncToggle()
+  end)
+  button:SetScript("OnEnter", function() ToggleLabelColor(button, true) end)
+  button:SetScript("OnLeave", function() ToggleLabelColor(button, false) end)
+  button:SetScript("OnClick", function()
+    local clickOk, clickError = pcall(Map.SetHidden, Map, not Map:Hidden())
+    if not clickOk and PC.RecordError then PC.RecordError("map toggle", clickError) end
+  end)
+  PinToggle(button)
+  Map:SyncToggle()
+end
+
+CreateToggle()
