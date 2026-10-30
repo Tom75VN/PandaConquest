@@ -2,7 +2,7 @@
 
 <h1 align="center">PandaConquest</h1>
 
-<p align="center"><b>Take Azeroth, one Outpost at a time. Gather, recruit, and lead your faction's war.</b></p>
+<p align="center"><b>Conquer Azeroth. Collect, recruit, and lead your faction's war.</b></p>
 
 <p align="center">Built for the <b>OctoWoW 1.12.1</b> client. Alliance and Horde, from level 5.</p>
 
@@ -27,7 +27,7 @@
 >
 > **3. Play**
 >
-> 1. Start the game from the **Octo launcher**, with **nampower** ticked in its mods.
+> 1. Start the game from the **Octo launcher**, with **nampower** and `PandaConquestLauncher.dll` ticked in its mods.
 > 2. Log in with a character of level 5 or more, then open PandaConquest with `/pc` or the minimap button.
 >
 > From now on the companion starts and stops with the game by itself. No account to create, no installer, no window to manage.
@@ -165,7 +165,7 @@ The war moves as players play: some news can arrive late, and the Territory tab 
 
 - **Alpha**: PandaConquest is in early testing. Numbers and rules may still change.
 - **Level 5**: below level 5, the conquest is hidden and you cannot take part.
-- **Always launch from the Octo launcher** with nampower ticked; the companion follows the game on its own.
+- **Always launch from the Octo launcher** with nampower and `PandaConquestLauncher.dll` ticked; the companion follows the game on its own.
 - **Updates**: keep the addon and the companion up to date. You are told when an update is needed.
 
 ## Coming next
